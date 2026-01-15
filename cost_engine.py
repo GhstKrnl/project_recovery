@@ -29,7 +29,15 @@ def calculate_costs(df_schedule, df_resource):
     df_schedule["_rid"] = df_schedule["resource_id"].map(clean_key)
     df_resource["_rid"] = df_resource["resource_id"].map(clean_key)
     
-    merged = pd.merge(df_schedule, df_resource, on="_rid", how="left", suffixes=("", "_res"))
+    # DEDUP: Ensure unique Activity IDs to prevent double counting
+    if "activity_id" in df_schedule.columns:
+        df_schedule = df_schedule.drop_duplicates(subset=["activity_id"])
+    
+    # DEDUP: Ensure resource dataframe has unique entries for our join key
+    # We must reset index or keep first occurrence.
+    df_resource_unique = df_resource.drop_duplicates(subset=["_rid"])
+    
+    merged = pd.merge(df_schedule, df_resource_unique, on="_rid", how="left", suffixes=("", "_res"))
     
     # Calculate Metrics
     # planned_load_hours = planned_duration * resource_working_hours * fte

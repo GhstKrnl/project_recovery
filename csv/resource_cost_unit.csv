@@ -1,0 +1,11 @@
+resource_id,resource_rate,resource_max_fte,resource_start_date,resource_end_date,resource_working_hours,resource_calendar,resource_holidays,resource_skills,resource_name,resource_role,6_day_working?,7_day_working?
+1,100,1,2025-01-01,,8,5d_8h,,Data science,Alex,Data scientist,,
+2,90,1,2025-01-01,,9,5d_9h,,Data science,Reed,Data scientist,,
+3,80,1,2025-01-01,,8,5d_8h,,Accounts,Noah,Accountant,,
+4,70,1,2025-01-01,,9,5d_9h,,Accounts,Maya,Accountant,,
+5,60,1,2025-01-01,,8,5d_8h,,Management,Ethan,Project Manager,,
+6,50,1,2025-01-01,,9,5d_9h,,Management,Patel ,Project Manager,,
+7,40,1,2025-01-01,,8,5d_8h,,Python,Lucas,Software engineer,,
+8,30,1,2025-01-01,,9,5d_9h,,Python,Morgan,Software engineer,,
+9,20,1,2025-01-01,,8,5d_8h,,Javascript,Oliver,Web developer,,
+10,10,1,2025-01-01,,9,5d_9h,,Javascript,Sofia,Web developer,,
