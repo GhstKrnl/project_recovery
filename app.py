@@ -1120,37 +1120,298 @@ with tabs[4]: # EVM
         try:
             evm_metrics = evm_engine.calculate_evm_metrics(df_schedule, status_date=None, eac_method_index=selected_index)
             
-            # Display Metrics
-            # Group 1: Basic
-            st.divider()
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("PV (Planned Value)", f"${evm_metrics['PV']:,.2f}")
-            c2.metric("EV (Earned Value)", f"${evm_metrics['EV']:,.2f}")
-            c3.metric("AC (Actual Cost)", f"${evm_metrics['AC']:,.2f}")
-            c4.metric("BAC (Budget at Completion)", f"${evm_metrics['BAC']:,.2f}")
+            # Calculate detailed breakdowns for display
+            import forecasting_engine
             
-            # Group 2: Indices & Variance
-            st.divider()
-            c1, c2, c3, c4 = st.columns(4)
+            # Helper function to get calculation breakdown
+            def get_evm_breakdown():
+                breakdown = {
+                    "BAC": {"formula": "Sum of all Planned Costs", "details": []},
+                    "AC": {"formula": "Sum of all Actual Costs", "details": []},
+                    "EV": {"formula": "Sum of (Planned Cost × % Complete)", "details": []},
+                    "PV": {"formula": "Sum of (Planned Cost × Time Elapsed Fraction)", "details": []},
+                }
+                
+                total_bac = 0.0
+                total_ac = 0.0
+                total_ev = 0.0
+                total_pv = 0.0
+                total_remaining_cost = 0.0
+                
+                status_date = pd.Timestamp.now().date()
+                
+                for _, row in df_schedule.iterrows():
+                    planned_cost = row.get("planned_cost", 0) if pd.notna(row.get("planned_cost")) else 0
+                    actual_cost = row.get("actual_cost", 0) if pd.notna(row.get("actual_cost")) else 0
+                    remaining_cost = row.get("remaining_cost", 0) if pd.notna(row.get("remaining_cost")) else 0
+                    pct_comp = (row.get("percent_complete", 0) if pd.notna(row.get("percent_complete")) else 0) / 100.0
+                    act_id = row.get("activity_id", "Unknown")
+                    
+                    # BAC
+                    total_bac += planned_cost
+                    if planned_cost > 0:
+                        breakdown["BAC"]["details"].append(f"Activity {act_id}: ${planned_cost:,.2f}")
+                    
+                    # AC
+                    total_ac += actual_cost
+                    if actual_cost > 0:
+                        breakdown["AC"]["details"].append(f"Activity {act_id}: ${actual_cost:,.2f}")
+                    
+                    # EV
+                    ev_contrib = planned_cost * pct_comp
+                    total_ev += ev_contrib
+                    if planned_cost > 0:
+                        breakdown["EV"]["details"].append(f"Activity {act_id}: ${planned_cost:,.2f} × {pct_comp*100:.1f}% = ${ev_contrib:,.2f}")
+                    
+                    # PV
+                    p_start = row.get("planned_start")
+                    p_finish = row.get("planned_finish")
+                    if pd.notna(p_start) and pd.notna(p_finish):
+                        try:
+                            total_dur = forecasting_engine.count_working_days(p_start, p_finish, inclusive=True)
+                            s_date_str = status_date.isoformat()
+                            
+                            if s_date_str >= str(p_finish):
+                                elapsed = total_dur
+                            elif s_date_str < str(p_start):
+                                elapsed = 0
+                            else:
+                                elapsed = forecasting_engine.count_working_days(p_start, s_date_str, inclusive=True)
+                            
+                            fraction = elapsed / total_dur if total_dur > 0 else (1.0 if elapsed > 0 else 0.0)
+                            pv_contrib = planned_cost * fraction
+                            total_pv += pv_contrib
+                            
+                            if planned_cost > 0:
+                                breakdown["PV"]["details"].append(f"Activity {act_id}: ${planned_cost:,.2f} × {fraction*100:.1f}% (elapsed/total days) = ${pv_contrib:,.2f}")
+                        except:
+                            pass
+                    
+                    total_remaining_cost += remaining_cost
+                
+                breakdown["BAC"]["total"] = total_bac
+                breakdown["AC"]["total"] = total_ac
+                breakdown["EV"]["total"] = total_ev
+                breakdown["PV"]["total"] = total_pv
+                breakdown["total_remaining_cost"] = total_remaining_cost
+                
+                return breakdown
+            
+            breakdown = get_evm_breakdown()
             
             # Helper for formatting strings with "—" on Div/0
             def fmt_idx(val):
                 if val == float('inf'): return "—"
                 return f"{val:.2f}"
-                
-            c1.metric("CPI (Cost Perf.)", fmt_idx(evm_metrics['CPI']), delta=f"{evm_metrics['CPI']-1:.2f}" if evm_metrics['CPI']!=float('inf') else None)
-            c2.metric("SPI (Sched Perf.)", fmt_idx(evm_metrics['SPI']), delta=f"{evm_metrics['SPI']-1:.2f}" if evm_metrics['SPI']!=float('inf') else None)
-            c3.metric("CV (Cost Variance)", f"${evm_metrics['CV']:,.2f}")
-            c4.metric("SV (Sched Variance)", f"${evm_metrics['SV']:,.2f}")
+            
+            # Display Metrics with expandable calculation sections
+            # Group 1: Basic
+            st.divider()
+            c1, c2, c3, c4 = st.columns(4)
+            
+            with c1:
+                st.metric("PV (Planned Value)", f"${evm_metrics['PV']:,.2f}")
+                with st.expander("📊 Calculation Details", expanded=False):
+                    st.markdown(f"**Formula:** {breakdown['PV']['formula']}")
+                    st.markdown(f"**Total:** ${breakdown['PV']['total']:,.2f}")
+                    if breakdown['PV']['details']:
+                        st.markdown("**Breakdown by Activity:**")
+                        for detail in breakdown['PV']['details'][:10]:  # Show first 10
+                            st.markdown(f"- {detail}")
+                        if len(breakdown['PV']['details']) > 10:
+                            st.caption(f"... and {len(breakdown['PV']['details']) - 10} more activities")
+                    else:
+                        st.info("No activities with planned costs found.")
+            
+            with c2:
+                st.metric("EV (Earned Value)", f"${evm_metrics['EV']:,.2f}")
+                with st.expander("📊 Calculation Details", expanded=False):
+                    st.markdown(f"**Formula:** {breakdown['EV']['formula']}")
+                    st.markdown(f"**Total:** ${breakdown['EV']['total']:,.2f}")
+                    if breakdown['EV']['details']:
+                        st.markdown("**Breakdown by Activity:**")
+                        for detail in breakdown['EV']['details'][:10]:  # Show first 10
+                            st.markdown(f"- {detail}")
+                        if len(breakdown['EV']['details']) > 10:
+                            st.caption(f"... and {len(breakdown['EV']['details']) - 10} more activities")
+                    else:
+                        st.info("No activities with planned costs found.")
+            
+            with c3:
+                st.metric("AC (Actual Cost)", f"${evm_metrics['AC']:,.2f}")
+                with st.expander("📊 Calculation Details", expanded=False):
+                    st.markdown(f"**Formula:** {breakdown['AC']['formula']}")
+                    st.markdown(f"**Total:** ${breakdown['AC']['total']:,.2f}")
+                    if breakdown['AC']['details']:
+                        st.markdown("**Breakdown by Activity:**")
+                        for detail in breakdown['AC']['details'][:10]:  # Show first 10
+                            st.markdown(f"- {detail}")
+                        if len(breakdown['AC']['details']) > 10:
+                            st.caption(f"... and {len(breakdown['AC']['details']) - 10} more activities")
+                    else:
+                        st.info("No activities with actual costs found.")
+            
+            with c4:
+                st.metric("BAC (Budget at Completion)", f"${evm_metrics['BAC']:,.2f}")
+                with st.expander("📊 Calculation Details", expanded=False):
+                    st.markdown(f"**Formula:** {breakdown['BAC']['formula']}")
+                    st.markdown(f"**Total:** ${breakdown['BAC']['total']:,.2f}")
+                    if breakdown['BAC']['details']:
+                        st.markdown("**Breakdown by Activity:**")
+                        for detail in breakdown['BAC']['details'][:10]:  # Show first 10
+                            st.markdown(f"- {detail}")
+                        if len(breakdown['BAC']['details']) > 10:
+                            st.caption(f"... and {len(breakdown['BAC']['details']) - 10} more activities")
+                    else:
+                        st.info("No activities with planned costs found.")
+            
+            # Group 2: Indices & Variance
+            st.divider()
+            c1, c2, c3, c4 = st.columns(4)
+            
+            with c1:
+                cpi_val = evm_metrics['CPI']
+                st.metric("CPI (Cost Perf.)", fmt_idx(cpi_val), delta=f"{cpi_val-1:.2f}" if cpi_val!=float('inf') else None)
+                with st.expander("📊 Calculation Details", expanded=False):
+                    st.markdown("**Formula:** CPI = EV / AC")
+                    if evm_metrics['AC'] != 0:
+                        st.markdown(f"**Calculation:** ${evm_metrics['EV']:,.2f} / ${evm_metrics['AC']:,.2f} = **{fmt_idx(cpi_val)}**")
+                        if cpi_val > 1.0:
+                            st.success(f"✅ Cost Performance: Under budget (CPI > 1.0)")
+                        elif cpi_val < 1.0:
+                            st.warning(f"⚠️ Cost Performance: Over budget (CPI < 1.0)")
+                        else:
+                            st.info(f"ℹ️ Cost Performance: On budget (CPI = 1.0)")
+                    else:
+                        st.markdown(f"**Calculation:** ${evm_metrics['EV']:,.2f} / $0.00 = **{fmt_idx(cpi_val)}**")
+                        st.info("Note: AC is 0, so CPI calculation uses special handling.")
+            
+            with c2:
+                spi_val = evm_metrics['SPI']
+                st.metric("SPI (Sched Perf.)", fmt_idx(spi_val), delta=f"{spi_val-1:.2f}" if spi_val!=float('inf') else None)
+                with st.expander("📊 Calculation Details", expanded=False):
+                    st.markdown("**Formula:** SPI = EV / PV")
+                    if evm_metrics['PV'] != 0:
+                        st.markdown(f"**Calculation:** ${evm_metrics['EV']:,.2f} / ${evm_metrics['PV']:,.2f} = **{fmt_idx(spi_val)}**")
+                        if spi_val > 1.0:
+                            st.success(f"✅ Schedule Performance: Ahead of schedule (SPI > 1.0)")
+                        elif spi_val < 1.0:
+                            st.warning(f"⚠️ Schedule Performance: Behind schedule (SPI < 1.0)")
+                        else:
+                            st.info(f"ℹ️ Schedule Performance: On schedule (SPI = 1.0)")
+                    else:
+                        st.markdown(f"**Calculation:** ${evm_metrics['EV']:,.2f} / $0.00 = **{fmt_idx(spi_val)}**")
+                        st.info("Note: PV is 0, so SPI calculation uses special handling.")
+            
+            with c3:
+                cv_val = evm_metrics['CV']
+                st.metric("CV (Cost Variance)", f"${cv_val:,.2f}")
+                with st.expander("📊 Calculation Details", expanded=False):
+                    st.markdown("**Formula:** CV = EV - AC")
+                    st.markdown(f"**Calculation:** ${evm_metrics['EV']:,.2f} - ${evm_metrics['AC']:,.2f} = **${cv_val:,.2f}**")
+                    if cv_val > 0:
+                        st.success(f"✅ Cost Variance: Under budget by ${abs(cv_val):,.2f}")
+                    elif cv_val < 0:
+                        st.warning(f"⚠️ Cost Variance: Over budget by ${abs(cv_val):,.2f}")
+                    else:
+                        st.info(f"ℹ️ Cost Variance: On budget")
+            
+            with c4:
+                sv_val = evm_metrics['SV']
+                st.metric("SV (Sched Variance)", f"${sv_val:,.2f}")
+                with st.expander("📊 Calculation Details", expanded=False):
+                    st.markdown("**Formula:** SV = EV - PV")
+                    st.markdown(f"**Calculation:** ${evm_metrics['EV']:,.2f} - ${evm_metrics['PV']:,.2f} = **${sv_val:,.2f}**")
+                    if sv_val > 0:
+                        st.success(f"✅ Schedule Variance: Ahead of schedule by ${abs(sv_val):,.2f}")
+                    elif sv_val < 0:
+                        st.warning(f"⚠️ Schedule Variance: Behind schedule by ${abs(sv_val):,.2f}")
+                    else:
+                        st.info(f"ℹ️ Schedule Variance: On schedule")
             
             # Group 3: Forecasting
             st.divider()
             st.markdown(f"**Forecasting (Method: {selected_eac_label})**")
             c1, c2, c3, c4 = st.columns(4)
-            c1.metric("EAC (Estimate At Comp.)", f"${evm_metrics['EAC']:,.2f}")
-            c2.metric("ETC (Est. To Complete)", f"${evm_metrics['ETC']:,.2f}")
-            c3.metric("VAC (Variance At Comp.)", f"${evm_metrics['VAC']:,.2f}", delta_color="normal")
-            c4.metric("TCPI (to BAC)", fmt_idx(evm_metrics['TCPI_BAC']))
+            
+            with c1:
+                eac_val = evm_metrics['EAC']
+                st.metric("EAC (Estimate At Comp.)", f"${eac_val:,.2f}")
+                with st.expander("📊 Calculation Details", expanded=False):
+                    st.markdown(f"**Formula:** {selected_eac_label}")
+                    if selected_index == 0:
+                        st.markdown(f"**Calculation:** ${evm_metrics['AC']:,.2f} + ${breakdown['total_remaining_cost']:,.2f} = **${eac_val:,.2f}**")
+                        st.markdown(f"- AC (Actual Cost): ${evm_metrics['AC']:,.2f}")
+                        st.markdown(f"- Remaining Cost (Bottom-up): ${breakdown['total_remaining_cost']:,.2f}")
+                    elif selected_index == 1:
+                        if evm_metrics['CPI'] != 0 and evm_metrics['CPI'] != float('inf'):
+                            st.markdown(f"**Calculation:** ${evm_metrics['BAC']:,.2f} / {fmt_idx(evm_metrics['CPI'])} = **${eac_val:,.2f}**")
+                            st.markdown(f"- BAC: ${evm_metrics['BAC']:,.2f}")
+                            st.markdown(f"- CPI: {fmt_idx(evm_metrics['CPI'])}")
+                        else:
+                            st.markdown(f"**Calculation:** Cannot divide by CPI (value: {fmt_idx(evm_metrics['CPI'])})")
+                    elif selected_index == 2:
+                        st.markdown(f"**Calculation:** ${evm_metrics['AC']:,.2f} + (${evm_metrics['BAC']:,.2f} - ${evm_metrics['EV']:,.2f}) = **${eac_val:,.2f}**")
+                        st.markdown(f"- AC: ${evm_metrics['AC']:,.2f}")
+                        st.markdown(f"- BAC - EV: ${evm_metrics['BAC']:,.2f} - ${evm_metrics['EV']:,.2f} = ${evm_metrics['BAC'] - evm_metrics['EV']:,.2f}")
+                    elif selected_index == 3:
+                        st.markdown(f"**Calculation:** ${evm_metrics['AC']:,.2f} + ${breakdown['total_remaining_cost']:,.2f} = **${eac_val:,.2f}**")
+                        st.markdown(f"- AC: ${evm_metrics['AC']:,.2f}")
+                        st.markdown(f"- Bottom-up ETC: ${breakdown['total_remaining_cost']:,.2f}")
+                    elif selected_index == 4:
+                        denom = evm_metrics['CPI'] * evm_metrics['SPI']
+                        if denom != 0 and denom != float('inf'):
+                            numerator = evm_metrics['BAC'] - evm_metrics['EV']
+                            st.markdown(f"**Calculation:** ${evm_metrics['AC']:,.2f} + (${evm_metrics['BAC']:,.2f} - ${evm_metrics['EV']:,.2f}) / ({fmt_idx(evm_metrics['CPI'])} × {fmt_idx(evm_metrics['SPI'])}) = **${eac_val:,.2f}**")
+                            st.markdown(f"- AC: ${evm_metrics['AC']:,.2f}")
+                            st.markdown(f"- (BAC - EV) / (CPI × SPI): ${numerator:,.2f} / {fmt_idx(denom)} = ${numerator/denom:,.2f}")
+                        else:
+                            st.markdown(f"**Calculation:** Cannot divide by (CPI × SPI) = {fmt_idx(denom)}")
+            
+            with c2:
+                etc_val = evm_metrics['ETC']
+                st.metric("ETC (Est. To Complete)", f"${etc_val:,.2f}")
+                with st.expander("📊 Calculation Details", expanded=False):
+                    st.markdown("**Formula:** ETC = EAC - AC")
+                    st.markdown(f"**Calculation:** ${eac_val:,.2f} - ${evm_metrics['AC']:,.2f} = **${etc_val:,.2f}**")
+                    st.markdown(f"- EAC: ${eac_val:,.2f}")
+                    st.markdown(f"- AC: ${evm_metrics['AC']:,.2f}")
+            
+            with c3:
+                vac_val = evm_metrics['VAC']
+                st.metric("VAC (Variance At Comp.)", f"${vac_val:,.2f}", delta_color="normal")
+                with st.expander("📊 Calculation Details", expanded=False):
+                    st.markdown("**Formula:** VAC = BAC - EAC")
+                    st.markdown(f"**Calculation:** ${evm_metrics['BAC']:,.2f} - ${eac_val:,.2f} = **${vac_val:,.2f}**")
+                    st.markdown(f"- BAC: ${evm_metrics['BAC']:,.2f}")
+                    st.markdown(f"- EAC: ${eac_val:,.2f}")
+                    if vac_val > 0:
+                        st.success(f"✅ Variance at Completion: Under budget by ${abs(vac_val):,.2f}")
+                    elif vac_val < 0:
+                        st.warning(f"⚠️ Variance at Completion: Over budget by ${abs(vac_val):,.2f}")
+                    else:
+                        st.info(f"ℹ️ Variance at Completion: On budget")
+            
+            with c4:
+                tcpi_bac_val = evm_metrics['TCPI_BAC']
+                st.metric("TCPI (to BAC)", fmt_idx(tcpi_bac_val))
+                with st.expander("📊 Calculation Details", expanded=False):
+                    st.markdown("**Formula:** TCPI = (BAC - EV) / (BAC - AC)")
+                    remaining_work = evm_metrics['BAC'] - evm_metrics['EV']
+                    remaining_budget = evm_metrics['BAC'] - evm_metrics['AC']
+                    if remaining_budget != 0:
+                        st.markdown(f"**Calculation:** (${evm_metrics['BAC']:,.2f} - ${evm_metrics['EV']:,.2f}) / (${evm_metrics['BAC']:,.2f} - ${evm_metrics['AC']:,.2f}) = **{fmt_idx(tcpi_bac_val)}**")
+                        st.markdown(f"- Remaining Work (BAC - EV): ${remaining_work:,.2f}")
+                        st.markdown(f"- Remaining Budget (BAC - AC): ${remaining_budget:,.2f}")
+                        if tcpi_bac_val > 1.0:
+                            st.warning(f"⚠️ TCPI > 1.0: Need better performance to meet BAC")
+                        elif tcpi_bac_val < 1.0:
+                            st.success(f"✅ TCPI < 1.0: Can achieve BAC with current performance")
+                        else:
+                            st.info(f"ℹ️ TCPI = 1.0: Current performance will meet BAC")
+                    else:
+                        st.markdown(f"**Calculation:** Cannot divide by (BAC - AC) = ${remaining_budget:,.2f}")
+                        st.info("Note: Remaining budget is 0, so TCPI calculation uses special handling.")
             
         except Exception as e:
             st.error(f"EVM Calculation Error: {e}")
