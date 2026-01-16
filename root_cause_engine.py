@@ -3,7 +3,6 @@ import numpy as np
 
 # Rule Constants
 CAT_CRITICAL_SLIP = "Critical Path Slippage"
-CAT_NEG_FLOAT = "Negative Float / Logic Constraint"
 CAT_RES_OVERLOAD = "Resource Overallocation"
 CAT_COST_OVERRUN = "Cost Overrun"
 CAT_RISK = "Risk / Uncertainty (Proxy)"
@@ -72,24 +71,17 @@ def execute_root_cause_analysis(df_schedule, resource_stats):
             impact_days = task_created_delay
             explanation = f"Critical task created {task_created_delay} days of delay."
             
-        # 2. Negative Float / Logic Constraint
-        elif total_float < 0: # Strict check
-             # And delay driven by logic? Implicit if float is negative.
-             category = CAT_NEG_FLOAT
-             certainty = CERTAINTY_INDIRECT
-             impact_days = abs(total_float) # Negative float magnitude is the impact/slip needed to recover
-             explanation = f"Negative float ({total_float} days) indicates infeasible logic."
-             
-        # 3. Resource Overallocation
-        elif res_overload_days > 0:
-             # AND delay attributable? 
-             # If Task has Created Delay OR Total Delay?
-             if total_sched_delay > 0:
+        # --- Rule 3: Resource Overallocation ---
+        # Trigger: resource_id exists and is in overload dict
+        elif resource_id and str(resource_id) in resource_stats:
+            overload_days = resource_stats[str(resource_id)]["overload_days_count"]
+            if overload_days > 0:
+                 res_name = resource_stats[str(resource_id)]["resource_name"]
                  category = CAT_RES_OVERLOAD
-                 certainty = CERTAINTY_INDIRECT
-                 impact_days = total_sched_delay # Attributing total delay to resource contention
-                 explanation = f"Resource '{resource_id}' is overloaded by {res_overload_days} days."
-             else:
+                 certainty = CERTAINTY_DIRECT
+                 impact_days = remaining_duration # Impact is potential delay due to unavailability
+                 explanation = f"Assigned resource '{res_name}' is overloaded by {overload_days} days."
+            else:
                  # No delay yet -> Risk?
                  pass 
                  

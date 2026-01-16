@@ -98,6 +98,37 @@ class TestRecovery(unittest.TestCase):
         self.assertGreater(params.get('savings', 0), 0, "Savings should be positive")
         self.assertIsNotNone(params.get('match_pct'), "Match % should not be None")
         self.assertIsNotNone(r2_swap.get('narrative'), "Action should have a story/narrative")
+        
+        # Test narrative formatting - should be clean single-line string
+        narrative = r2_swap.get('narrative')
+        self.assertIsInstance(narrative, str, "Narrative should be a string")
+        
+        # Check that narrative is a single line (no newlines or line breaks)
+        self.assertEqual(narrative.count('\n'), 0, "Narrative should be a single line")
+        
+        # Check that markdown formatting is present (will be rendered by st.markdown)
+        self.assertIn("**Trigger:**", narrative, "Narrative should start with Trigger")
+        self.assertIn("**", narrative, "Narrative should contain markdown bold markers")
+        
+        # Check that dollar amounts are formatted correctly (with .1f precision)
+        import re
+        # Should match pattern like $50.0/hr or $100.0/hr
+        dollar_pattern = r'\$\d+\.\d+/hr'
+        self.assertRegex(narrative, dollar_pattern, "Narrative should contain properly formatted dollar amounts")
+        
+        # Check that resource names appear (without bold formatting)
+        self.assertIn(params.get('old_name'), narrative, "Old resource name should appear in narrative")
+        self.assertIn(params.get('new_name'), narrative, "New resource name should appear in narrative")
+        # Resource names should NOT be bolded
+        self.assertNotIn(f"**{params.get('old_name')}**", narrative, "Old resource name should not be bolded")
+        self.assertNotIn(f"**{params.get('new_name')}**", narrative, "New resource name should not be bolded")
+        
+        # Check that skills match percentage is included
+        self.assertIn(f"Skills match: {params.get('match_pct')}%", narrative, "Narrative should include skills match percentage")
+        
+        # Check that availability verification is mentioned
+        self.assertIn("Availability verified", narrative, "Narrative should mention availability verification")
+        self.assertIn("preventing overallocation", narrative, "Narrative should mention preventing overallocation")
 
     def test_fte_logic(self):
         # Setup: Task A is critical, FTE 0.5 (in Setup it is 1.0, let's override)
@@ -105,6 +136,8 @@ class TestRecovery(unittest.TestCase):
         # Resource R1 Max FTE is default 1.0? 
         # We need to add 'resource_max_fte' to df_resource mock
         self.df_resource["resource_max_fte"] = 1.0 # Add column
+        # Add work_hours for cost calculation
+        self.df_resource["resource_working_hours"] = 8.0
         
         actions = recovery_engine.generate_actions(self.df, {}, self.df_resource, self.root_causes)
         
@@ -118,6 +151,75 @@ class TestRecovery(unittest.TestCase):
         self.assertIn("Project: Project Alpha", fte_action['description'])
         self.assertIsNotNone(fte_action.get('id'))
         self.assertEqual(fte_action.get('resource_name'), "Alice")
+    
+    def test_fte_cost_calculation(self):
+        """
+        Test that FTE adjustment cost calculation is correct.
+        When FTE increases and duration decreases proportionally, 
+        total hours (and cost) should remain the same.
+        
+        Example:
+        - Old: 10 days * 0.5 FTE = 5 person-days = 40 hours (at 8h/day)
+        - New: 5 days * 1.0 FTE = 5 person-days = 40 hours (at 8h/day)
+        - Cost should be the same: 40 hours * rate
+        """
+        import cost_engine
+        
+        # Setup: Task with specific FTE and duration
+        self.df.loc[0, "fte_allocation"] = 0.5
+        self.df.loc[0, "remaining_duration_days"] = 10.0
+        self.df_resource["resource_max_fte"] = 1.0
+        self.df_resource["resource_working_hours"] = 8.0
+        self.df_resource["resource_rate"] = 100.0  # $100/hour
+        
+        # Generate FTE adjustment action
+        actions = recovery_engine.generate_actions(self.df, {}, self.df_resource, self.root_causes)
+        fte_action = next((a for a in actions if a['type'] == recovery_engine.ACTION_FTE_ADJ), None)
+        
+        self.assertIsNotNone(fte_action, "Should have FTE adjustment action")
+        
+        params = fte_action['parameters']
+        old_fte = params['old_fte']
+        new_fte = params['new_fte']
+        old_dur = params['old_dur']
+        new_dur = params['new_dur']
+        cost_impact = params.get('cost_impact', 0)
+        
+        # Verify FTE and duration changes
+        self.assertEqual(old_fte, 0.5, "Old FTE should be 0.5")
+        self.assertEqual(new_fte, 1.0, "New FTE should be 1.0")
+        self.assertEqual(old_dur, 10.0, "Old duration should be 10 days")
+        self.assertEqual(new_dur, 5.0, "New duration should be 5 days (10 * 0.5/1.0)")
+        
+        # Calculate expected costs manually
+        rate = 100.0
+        work_hours = 8.0
+        
+        # Old remaining cost = duration * work_hours * fte * rate
+        old_cost = old_dur * work_hours * old_fte * rate
+        # New remaining cost = duration * work_hours * fte * rate
+        new_cost = new_dur * work_hours * new_fte * rate
+        
+        expected_old_cost = 10.0 * 8.0 * 0.5 * 100.0  # = 4000
+        expected_new_cost = 5.0 * 8.0 * 1.0 * 100.0   # = 4000
+        
+        self.assertEqual(old_cost, expected_old_cost, f"Old cost should be {expected_old_cost}")
+        self.assertEqual(new_cost, expected_new_cost, f"New cost should be {expected_new_cost}")
+        self.assertEqual(old_cost, new_cost, "Cost should remain the same (total hours unchanged)")
+        
+        # Verify cost_impact in action parameters
+        expected_cost_diff = new_cost - old_cost
+        self.assertAlmostEqual(cost_impact, expected_cost_diff, places=2, 
+                              msg=f"Cost impact should be {expected_cost_diff} (should be 0 or very close)")
+        
+        # Print calculation details for verification
+        print(f"\nFTE Cost Calculation Test:")
+        print(f"  Old: {old_dur} days * {work_hours} hrs/day * {old_fte} FTE * ${rate}/hr = ${old_cost:,.2f}")
+        print(f"  New: {new_dur} days * {work_hours} hrs/day * {new_fte} FTE * ${rate}/hr = ${new_cost:,.2f}")
+        print(f"  Total Hours (Old): {old_dur * old_fte * work_hours} hours")
+        print(f"  Total Hours (New): {new_dur * new_fte * work_hours} hours")
+        print(f"  Cost Difference: ${cost_impact:,.2f}")
+        print(f"  Conclusion: Cost should be same because total hours are unchanged")
 
     def test_compression_logic(self):
         # Trigger: Critical Path Slippage
@@ -148,6 +250,93 @@ class TestRecovery(unittest.TestCase):
         self.assertIsNotNone(ft_action)
         self.assertIn("Convert Predecessors to SS + Lag", ft_action['description'])
         
+    def test_resource_swap_narrative_formatting(self):
+        """
+        Test that Resource Swap narratives are properly formatted:
+        - Single-line string (no line breaks)
+        - Proper markdown formatting
+        - Dollar amounts formatted with .1f precision
+        - No literal markdown characters that would display incorrectly
+        """
+        # Setup: Create a scenario with a resource swap
+        schedule_with_busy_r3 = self.df.copy()
+        busy_task = {
+            "activity_id": "B",
+            "resource_id": "R3",
+            "planned_start": "2024-01-05",
+            "planned_finish": "2024-01-06"
+        }
+        schedule_with_busy_r3 = pd.concat([schedule_with_busy_r3, pd.DataFrame([busy_task])], ignore_index=True)
+
+        actions = recovery_engine.generate_actions(schedule_with_busy_r3, {}, self.df_resource, self.root_causes)
+        
+        # Get a resource swap action
+        swaps = [a for a in actions if a['type'] == recovery_engine.ACTION_RES_SWAP and a['activity_id'] == "A"]
+        self.assertGreater(len(swaps), 0, "Should have at least one swap action")
+        
+        swap_action = swaps[0]
+        narrative = swap_action.get('narrative')
+        
+        # Test 1: Narrative should be a single-line string
+        self.assertIsInstance(narrative, str, "Narrative should be a string")
+        self.assertEqual(narrative.count('\n'), 0, "Narrative should be a single line (no newlines)")
+        
+        # Test 2: Should not contain problematic patterns that would display incorrectly
+        # Should not have spaces before closing **
+        self.assertNotRegex(narrative, r'\*\* \w+ \*\*', "Narrative should not have spaces inside markdown bold markers")
+        
+        # Test 3: Dollar amounts should be properly formatted (e.g., $50.0/hr not $50/hr or $50.00/hr)
+        import re
+        dollar_pattern = r'\$\d+\.\d+/hr'
+        matches = re.findall(dollar_pattern, narrative)
+        self.assertGreater(len(matches), 0, "Narrative should contain properly formatted dollar amounts")
+        
+        # Test 4: Should contain proper markdown structure
+        self.assertIn("**Trigger:**", narrative, "Narrative should start with 'Trigger:' in bold")
+        
+        # Test 5: Resource names should appear without bold formatting (just plain text)
+        params = swap_action['parameters']
+        old_name = params.get('old_name')
+        new_name = params.get('new_name')
+        if old_name:
+            # Check that name appears without bold formatting
+            self.assertIn(old_name, narrative, f"Old resource name '{old_name}' should appear in narrative")
+            # Should NOT have bold markers around the name
+            self.assertNotIn(f"**{old_name}**", narrative, f"Old resource name '{old_name}' should not be bolded")
+        if new_name:
+            self.assertIn(new_name, narrative, f"New resource name '{new_name}' should appear in narrative")
+            # Should NOT have bold markers around the name
+            self.assertNotIn(f"**{new_name}**", narrative, f"New resource name '{new_name}' should not be bolded")
+        
+        # Test 6: Skills match percentage should be included
+        match_pct = params.get('match_pct')
+        if match_pct is not None:
+            self.assertIn(f"Skills match: {match_pct}%", narrative, "Narrative should include skills match percentage")
+        
+        # Test 7: Should not have literal markdown artifacts that would display incorrectly
+        # Check that we don't have patterns like "**Name **" (space before closing **)
+        problematic_patterns = [
+            r'\*\* \w+ \*\*',  # Space before closing **
+            r'\(\s*\*\*',      # Space before ** in parentheses
+            r'\*\*\s+\)',      # Space after ** before closing paren
+        ]
+        for pattern in problematic_patterns:
+            self.assertNotRegex(narrative, pattern, f"Narrative should not contain problematic pattern: {pattern}")
+        
+        # Test 8: Verify the narrative format matches expected structure
+        # Should be: **Trigger:** Found cheaper resource Name1 ($X.X/hr) vs Name2 ($X.X/hr). Skills match: X%. Availability verified: ...
+        expected_structure = r'\*\*Trigger:\*\* Found cheaper resource .+? \(\$.*?/hr\) vs .+? \(\$.*?/hr\)\. Skills match: \d+%\. Availability verified:'
+        self.assertRegex(narrative, expected_structure, "Narrative should match expected format structure")
+        
+        # Test 9: Should mention availability verification
+        self.assertIn("Availability verified", narrative, "Narrative should mention availability verification")
+        self.assertIn("not assigned to any overlapping activities", narrative, "Narrative should mention no overlapping activities")
+        self.assertIn("preventing overallocation", narrative, "Narrative should mention preventing overallocation")
+        
+        # Print success message (without special Unicode characters for Windows compatibility)
+        print(f"\nNarrative format test passed!")
+        print(f"  Narrative: {narrative}")
+
     def test_no_results_scenario(self):
         # Scenario where NO actions should be generated
         # 1. Non-critical task (No FTE/Compress/FastTrack)

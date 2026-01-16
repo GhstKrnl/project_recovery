@@ -70,35 +70,15 @@ def calculate_forecasts(df, G):
     """
     Calculates forecasting metrics and returns a DataFrame (or dict) to merge.
     Assumes df has 'ES_date', 'EF_date' (CPM results) and 'baseline_1_start/finish'.
+    Uses Topological Sort to propagate Delay Carried In correctly.
     """
     results = {}
     
     # Pre-process dataframe to dict for speed
-    # We need access to predecessors' actuals for "Delay Carried In"
-    # Create lookup map
-    
-    # We need to act row by row, but topological order isn't strictly necessary 
-    # if we assume standard 1-depth lookups or if graph edges hold the lags.
-    # But "Delay Carried In" looks at Predecessors. 
-    # We can iterate through the Graph nodes.
-    
-    # Convert dates to strings/objects once
-    # Ensure columns exist
     cols = ["activity_id", "actual_start", "actual_finish", "baseline_1_start", "baseline_1_finish", 
             "ES_date", "EF_date", "planned_duration"]
-    
-    # Helper to safe get
-    def get_val(row, col):
-        if col in row and not pd.isna(row[col]):
-            return row[col]
-        return None
-
-    # We need a quick lookup for node data
-    # Iterating over G.nodes
-    
-    # Create a look up dict from df
-    # Key: activity_id (clean)
-    
+            
+    # Lookup map: activity_id -> row
     df_lookup = {}
     for idx, row in df.iterrows():
         try:
@@ -106,8 +86,15 @@ def calculate_forecasts(df, G):
             df_lookup[aid] = row
         except:
             pass
+
+    # Ensure Topological Order for propagation
+    if nx.is_directed_acyclic_graph(G):
+        ordered_nodes = list(nx.topological_sort(G))
+    else:
+        # Fallback if cycles exist (should be handled by app.py validation, but safety check)
+        ordered_nodes = list(G.nodes)
             
-    for node in G.nodes:
+    for node in ordered_nodes:
         # Defaults
         res = {
             "percent_complete": 0,
@@ -126,6 +113,9 @@ def calculate_forecasts(df, G):
         if row is None:
             results[node] = res
             continue
+            
+        # Helper
+        def get_val(r, c): return r[c] if c in r and not pd.isna(r[c]) else None
             
         # 1. Percent Complete & Actual/Remaining Duration
         act_start = get_val(row, "actual_start")
@@ -148,9 +138,11 @@ def calculate_forecasts(df, G):
             res["baseline_1_duration"] = 0
 
         # Logic
+        forecast_start_for_delay = None
+        forecast_fin_for_delay = None
+
         if act_fin:
             res["percent_complete"] = 100
-            # Actual Duration (Inclusive)
             res["actual_duration"] = count_working_days(act_start, act_fin, inclusive=True)
             res["remaining_duration_days"] = 0
             
@@ -158,33 +150,44 @@ def calculate_forecasts(df, G):
             res["forecast_start_date"] = act_start
             res["forecast_finish_date"] = act_fin
             
-            forecast_fin_for_delay = act_fin
             forecast_start_for_delay = act_start
+            forecast_fin_for_delay = act_fin
             
         else:
             # 0% or In Progress
-            res["percent_complete"] = 0 # As per requirement (empty actual_finish -> 0)
-            res["actual_duration"] = 0 # Or partial? Req says 0 logic implied.
+            res["percent_complete"] = 0 # MVP Requirement
+            res["actual_duration"] = 0
             
-            # If act_start is present?
             if act_start:
                  # In Progress
-                 # Logic for Remaining? Req says "actual_finish not present consider pct=0".
-                 # If pct=0, remaining = planned?
+                 # Calculate Forecast Finish based on Actual Start + Planned Duration
+                 # (Simplification: assuming original duration holds if not updated)
                  res["remaining_duration_days"] = plan_dur
-                 # Forecast Start = Actual Start
                  res["forecast_start_date"] = act_start
-                 # Forecast Finish?
-                 # If not finished, we probably shouldn't use CPM EF directly if we started late.
-                 # But sticking to MVP scope: "Forecast...".
-                 # If we use CPM EF, it ignores Actual Start.
-                 # But we don't have a re-calc mechanism here.
-                 # Let's use CPM EF as fallback for Finish.
-                 res["forecast_finish_date"] = cpm_ef
+                 
+                 # Calc finish date: Start + Duration (Business Days)
+                 # We need date math here. 
+                 # However, we don't have the heavy numpy date logic imported easily as helper here 
+                 # without duplicating cpm_engine logic or importing it.
+                 # BUT, we can use calculate_delay_metric_days kind of logic or simple approximation?
+                 # Better: Use numpy busday_offset since we imported numpy.
+                 
+                 try:
+                     s = np.datetime64(pd.to_datetime(act_start), 'D')
+                     # finish = start + duration - 1 (inclusive)
+                     dur_days = int(plan_dur)
+                     if dur_days > 0:
+                        offset = dur_days - 1
+                        f_np = np.busday_offset(s, offset, roll='forward', weekmask='1111100')
+                        res["forecast_finish_date"] = str(f_np)
+                     else:
+                        res["forecast_finish_date"] = act_start
+                 except:
+                     # Fallback
+                     res["forecast_finish_date"] = cpm_ef
                  
                  forecast_start_for_delay = act_start
-                 forecast_fin_for_delay = cpm_ef
-                 
+                 forecast_fin_for_delay = res["forecast_finish_date"]
             else:
                  # Not Started
                  res["remaining_duration_days"] = plan_dur
@@ -194,47 +197,42 @@ def calculate_forecasts(df, G):
                  forecast_start_for_delay = cpm_es
                  forecast_fin_for_delay = cpm_ef
 
-        # 2. Delay Carried In
-        # Max(Predecessor Actual Finish - Predecessor Baseline Finish)
+        # 2. Delay Carried In (CRITICAL FIX: Use Predecessor Forecasts, not just Actuals)
+        # We propagate max delay from predecessors
+        # Delay = Pred Forecast Finish - Pred Baseline Finish
+        
         preds = list(G.predecessors(node))
         carried_delays = [0]
         
         for pred in preds:
-            # Check pred stats
+            # Look up predecessor's result we just calculated (since topo sorted)
+            pred_res = results.get(pred) 
             p_row = df_lookup.get(pred)
-            if p_row is not None:
-                p_act_fin = get_val(p_row, "actual_finish")
+            
+            if pred_res and p_row is not None:
+                # Use Calculated Forecast Finish from predecessor logic
+                p_forecast_fin = pred_res.get("forecast_finish_date")
                 p_base_fin = get_val(p_row, "baseline_1_finish")
                 
-                # Formula: Pred Actual Fin - Pred Baseline Fin (User omitted lag in text simplification? "Pred.actual_finish + lag - Pred.baseline_finish - lag")
-                if p_act_fin and p_base_fin:
-                    d = calculate_delay_metric_days(p_act_fin, p_base_fin)
+                if p_forecast_fin and p_base_fin:
+                    d = calculate_delay_metric_days(p_forecast_fin, p_base_fin)
                     carried_delays.append(d)
         
-        res["delay_carried_in"] = max(0, max(carried_delays)) # MAX(0, ...)
+        res["delay_carried_in"] = max(0, max(carried_delays))
         
         # 3. Total Schedule Delay
-        # MAX( Act_Start - BL_Start, Act_Fin - BL_Fin ) 
-        # Using Forecast dates if Actual is missing (for checking variances)
-        
         start_var = 0
         fin_var = 0
-        
         if bl_start and forecast_start_for_delay:
              start_var = calculate_delay_metric_days(forecast_start_for_delay, bl_start)
-             
         if bl_fin and forecast_fin_for_delay:
-             fin_var = calculate_delay_metric_days(forecast_fin_for_delay, bl_fin)
-             
+             fin_var = calculate_delay_metric_days(forecast_fin_for_delay, bl_fin)  
         res["total_schedule_delay"] = max(start_var, fin_var)
         
         # 4. Task-Created Delay
-        # MAX(0, Total - Carried)
         res["task_created_delay"] = max(0, res["total_schedule_delay"] - res["delay_carried_in"])
         
         # 5. Delay Absorbed
-        # Carried - Task Created? 
-        # Formula: Delay Absorbed = Delay Carried In − Task-Created Delay
         res["delay_absorbed"] = res["delay_carried_in"] - res["task_created_delay"]
         
         results[node] = res
