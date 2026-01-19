@@ -104,6 +104,36 @@ if df_schedule is not None:
 portfolio_filter = st.sidebar.selectbox("Portfolio (from CSV)", portfolios)
 project_filter = st.sidebar.selectbox("Project (from CSV)", projects)
 activity_filter = st.sidebar.selectbox("Activity (from CSV)", activities)
+
+# Apply Global Filters to df_schedule
+# Store original unfiltered schedule for reference
+df_schedule_original = df_schedule.copy() if df_schedule is not None else None
+
+if df_schedule is not None:
+    df_schedule_filtered = df_schedule.copy()
+    
+    # Apply Portfolio Filter
+    if portfolio_filter != "All" and "portfolio_name" in df_schedule_filtered.columns:
+        df_schedule_filtered = df_schedule_filtered[df_schedule_filtered["portfolio_name"] == portfolio_filter]
+    
+    # Apply Project Filter
+    if project_filter != "All" and "project_id" in df_schedule_filtered.columns:
+        df_schedule_filtered = df_schedule_filtered[df_schedule_filtered["project_id"].astype(str) == str(project_filter)]
+    
+    # Apply Activity Filter
+    if activity_filter != "All" and "activity_id" in df_schedule_filtered.columns:
+        df_schedule_filtered = df_schedule_filtered[df_schedule_filtered["activity_id"].astype(str) == str(activity_filter)]
+    
+    # Show filter status
+    if portfolio_filter != "All" or project_filter != "All" or activity_filter != "All":
+        filtered_count = len(df_schedule_filtered)
+        total_count = len(df_schedule_original) if df_schedule_original is not None else len(df_schedule)
+        st.sidebar.info(f"📊 Filtered: {filtered_count} of {total_count} activities")
+    
+    # Update df_schedule to use filtered version for all tabs (even before analysis)
+    df_schedule = df_schedule_filtered
+else:
+    df_schedule_filtered = None
         
 st.sidebar.markdown("---")
 if st.sidebar.button("Run Analysis", type="primary"):
@@ -113,19 +143,20 @@ if st.sidebar.button("Run Analysis", type="primary"):
     st.session_state['applied_actions'] = set()
 
 # --- Validation & DAG Logic ---
-if st.session_state['analyzed'] and df_schedule is not None:
+# Use filtered schedule for all analysis
+if st.session_state['analyzed'] and df_schedule_filtered is not None:
     try:
         # Type Validation (Columns that must be dates)
         date_cols = ["planned_start", "planned_finish", "baseline_1_start", "baseline_1_finish", "actual_start", "actual_finish", "constraint_date"]
-        schedule_errors.extend(utils.validate_iso_dates(df_schedule, date_cols, "project_schedule.csv"))
+        schedule_errors.extend(utils.validate_iso_dates(df_schedule_filtered, date_cols, "project_schedule.csv"))
         
         # Numeric Validation
         num_cols = ["fte_allocation", "percent_complete", "probability_percent"]
-        schedule_errors.extend(utils.validate_numeric(df_schedule, num_cols, "project_schedule.csv"))
+        schedule_errors.extend(utils.validate_numeric(df_schedule_filtered, num_cols, "project_schedule.csv"))
         
         # --- MVP 1: Dependency Parsing & DAG ---
         # Build DAG and get validation status
-        dag_graph, dep_validation = dag_engine.build_dag_and_validate(df_schedule)
+        dag_graph, dep_validation = dag_engine.build_dag_and_validate(df_schedule_filtered)
         
         # Add Validation Column
         # Map validation results back to dataframe. 
@@ -133,14 +164,14 @@ if st.session_state['analyzed'] and df_schedule is not None:
         # Ensure activity_id is int for mapping
         try:
              # Create a temp column for mapping to avoid modifying original if it fails
-             df_schedule["_temp_id"] = pd.to_numeric(df_schedule["activity_id"], errors='coerce')
-             df_schedule["dependency_validation_status"] = df_schedule["_temp_id"].map(dep_validation)
+             df_schedule_filtered["_temp_id"] = pd.to_numeric(df_schedule_filtered["activity_id"], errors='coerce')
+             df_schedule_filtered["dependency_validation_status"] = df_schedule_filtered["_temp_id"].map(dep_validation)
              # Fill NaNs with "OK" (orphans with no preds/succs are just nodes, unless they had errors in map)
-             df_schedule["dependency_validation_status"] = df_schedule["dependency_validation_status"].fillna("OK")
+             df_schedule_filtered["dependency_validation_status"] = df_schedule_filtered["dependency_validation_status"].fillna("OK")
              
              # Fallback for Malformed IDs
-             mask_invalid_id = df_schedule["_temp_id"].isna()
-             df_schedule.loc[mask_invalid_id, "dependency_validation_status"] = "ERROR: Invalid Activity ID"
+             mask_invalid_id = df_schedule_filtered["_temp_id"].isna()
+             df_schedule_filtered.loc[mask_invalid_id, "dependency_validation_status"] = "ERROR: Invalid Activity ID"
              
              # --- MVP 2: CPM Calculation ---
              cpm_results = {}
@@ -151,18 +182,18 @@ if st.session_state['analyzed'] and df_schedule is not None:
                  
                  if not has_cycles:
                      # 1. Run CPM (Integer Days)
-                     cpm_results = cpm_engine.run_cpm(df_schedule, dag_graph)
+                     cpm_results = cpm_engine.run_cpm(df_schedule_filtered, dag_graph)
                      
                      # 2. Get Durations (for date calc)
                      # (Calculated inside run_cpm but local. We can re-calc or make run_cpm return it.
                      # Re-calc is cheap enough for now)
-                     durations_map = cpm_engine.calculate_durations(df_schedule)
+                     durations_map = cpm_engine.calculate_durations(df_schedule_filtered)
                      
                      # 3. Determine Project Start (Anchor)
                      # Min of planned_start.
                      # Handle NaTs
-                     if "planned_start" in df_schedule.columns:
-                         valid_starts = pd.to_datetime(df_schedule["planned_start"], errors='coerce').dropna()
+                     if "planned_start" in df_schedule_filtered.columns:
+                         valid_starts = pd.to_datetime(df_schedule_filtered["planned_start"], errors='coerce').dropna()
                          if not valid_starts.empty:
                              project_start = valid_starts.min()
                              
@@ -181,12 +212,12 @@ if st.session_state['analyzed'] and df_schedule is not None:
                                   
                      for col in deps_cols:
                          if col in cpm_df.columns:
-                            df_schedule[col] = df_schedule["_temp_id"].map(cpm_df[col])
+                            df_schedule_filtered[col] = df_schedule_filtered["_temp_id"].map(cpm_df[col])
                             
                      # --- MVP 4: Forecasting ---
                      # Ensure we run this inside the no-cycle block
                      try:
-                         forecast_results = forecasting_engine.calculate_forecasts(df_schedule, dag_graph)
+                         forecast_results = forecasting_engine.calculate_forecasts(df_schedule_filtered, dag_graph)
                          fc_df = pd.DataFrame.from_dict(forecast_results, orient='index')
                          
                          fc_cols = ["percent_complete", "actual_duration", "baseline_1_duration", "remaining_duration_days",
@@ -196,12 +227,12 @@ if st.session_state['analyzed'] and df_schedule is not None:
                                     
                          for col in fc_cols:
                              if col in fc_df.columns:
-                                 df_schedule[col] = df_schedule["_temp_id"].map(fc_df[col])
+                                 df_schedule_filtered[col] = df_schedule_filtered["_temp_id"].map(fc_df[col])
                                  
                          # DEBUG: Verify Logic Update
                          max_delay_carry = 0
-                         if "delay_carried_in" in df_schedule.columns:
-                             max_delay_carry = df_schedule["delay_carried_in"].max()
+                         if "delay_carried_in" in df_schedule_filtered.columns:
+                             max_delay_carry = df_schedule_filtered["delay_carried_in"].max()
                          
                          if max_delay_carry == 0:
                              # Extra check: print raw fc_df stats
@@ -221,9 +252,9 @@ if st.session_state['analyzed'] and df_schedule is not None:
                      
                      if df_resource is not None:
                          try:
-                             cost_df_results = cost_engine.calculate_costs(df_schedule, df_resource)
+                             cost_df_results = cost_engine.calculate_costs(df_schedule_filtered, df_resource)
                              
-                             # Map back to df_schedule (activity_id is key)
+                             # Map back to df_schedule_filtered (activity_id is key)
                              # Create lookup
                              cost_lookup = cost_df_results.set_index("activity_id")
                              
@@ -233,7 +264,7 @@ if st.session_state['analyzed'] and df_schedule is not None:
                              for col in cost_cols:
                                  if col in cost_lookup.columns:
                                      # Safe mapping
-                                     df_schedule[col] = df_schedule["activity_id"].map(cost_lookup[col])
+                                     df_schedule_filtered[col] = df_schedule_filtered["activity_id"].map(cost_lookup[col])
                                      
                              # Overload Check
                              resource_stats = cost_engine.check_resource_availability(cost_df_results)
@@ -243,7 +274,7 @@ if st.session_state['analyzed'] and df_schedule is not None:
 
                          # --- MVP 7: Root Cause ---
                          try:
-                             rc_df = root_cause_engine.execute_root_cause_analysis(df_schedule, resource_stats)
+                             rc_df = root_cause_engine.execute_root_cause_analysis(df_schedule_filtered, resource_stats)
                              
                              # --- MVP 8: Recovery Action Generation ---
                              # Init workspace if not present (or reset on new analysis?)
@@ -252,7 +283,7 @@ if st.session_state['analyzed'] and df_schedule is not None:
                              # If user clicks "Run Analysis", likely resetting baseline state or re-calcing.
                              # Let's Refresh Recovery Workspace on Run Analysis to sync with new data.
                              if st.session_state['recovery_schedule'] is None:
-                                 st.session_state['recovery_schedule'] = recovery_engine.init_recovery_workspace(df_schedule)
+                                 st.session_state['recovery_schedule'] = recovery_engine.init_recovery_workspace(df_schedule_filtered)
                              
                              # Generate Actions ONLY if not already present (Preserve list for UI persistence)
                              if not st.session_state['generated_actions']:
@@ -271,7 +302,10 @@ if st.session_state['analyzed'] and df_schedule is not None:
              except Exception as cpm_e:
                  st.error(f"Error in CPM Logic: {cpm_e}")
 
-             del df_schedule["_temp_id"]
+             del df_schedule_filtered["_temp_id"]
+             
+             # Update df_schedule to use filtered version for all tabs
+             df_schedule = df_schedule_filtered
              
         except Exception as e:
              st.error(f"Error applying dependency validation: {e}")
@@ -560,7 +594,16 @@ with tabs[1]: # Schedule Recovery
                 pred_id = params.get('related_pred_id', 'Unknown')
                 saving = params.get('estimated_savings', 0)
                 
-                title = f"{act_id}: Critical Path | Waiting for {pred_id}"
+                # Look up project info from recovery schedule
+                project_name = "Unknown Project"
+                if st.session_state.get('recovery_schedule') is not None:
+                    act_row = st.session_state['recovery_schedule'][
+                        st.session_state['recovery_schedule']["activity_id"].astype(str) == str(act_id)
+                    ]
+                    if not act_row.empty:
+                        project_name = act_row.iloc[0].get("project_name", "Unknown Project")
+                
+                title = f"Project: {project_name} | Activity ID: {act_id} | Critical Path | Waiting for Activity: {pred_id}"
                 
                 with st.expander(title, expanded=False):
                     # Narrative
@@ -593,6 +636,71 @@ with tabs[1]: # Schedule Recovery
                             if st.button("Apply Fast-Track", key=f"btn_ft_{i}", type="primary"):
                                 success, msg = recovery_engine.apply_action(st.session_state['recovery_schedule'], action)
                                 if success:
+                                    # Recalculate dates after Fast-Track changes dependencies
+                                    # Fast-Track changes predecessor relationships, so we need to rebuild DAG and recalculate CPM/Forecasting
+                                    try:
+                                        # Rebuild DAG with updated predecessors
+                                        dag_graph_updated, _ = dag_engine.build_dag_and_validate(st.session_state['recovery_schedule'])
+                                        
+                                        # Recalculate CPM with updated dependencies
+                                        cpm_results_updated = cpm_engine.run_cpm(st.session_state['recovery_schedule'], dag_graph_updated)
+                                        durations_map_updated = cpm_engine.calculate_durations(st.session_state['recovery_schedule'])
+                                        
+                                        # Determine project start
+                                        if "planned_start" in st.session_state['recovery_schedule'].columns:
+                                            valid_starts = pd.to_datetime(st.session_state['recovery_schedule']["planned_start"], errors='coerce').dropna()
+                                            if not valid_starts.empty:
+                                                project_start = valid_starts.min()
+                                            else:
+                                                project_start = pd.Timestamp.today()
+                                        else:
+                                            project_start = pd.Timestamp.today()
+                                        
+                                        # Convert offsets to dates
+                                        cpm_results_updated = cpm_engine.convert_offsets_to_dates(cpm_results_updated, project_start, durations_map_updated)
+                                        
+                                        # Map CPM results back to recovery schedule
+                                        cpm_df_updated = pd.DataFrame.from_dict(cpm_results_updated, orient='index')
+                                        deps_cols = ["ES", "EF", "LS", "LF", "total_float_days", "on_critical_path", 
+                                                     "ES_date", "EF_date", "LS_date", "LF_date", "planned_duration"]
+                                        
+                                        # Create temp ID column for mapping
+                                        st.session_state['recovery_schedule']["_temp_id"] = pd.to_numeric(st.session_state['recovery_schedule']["activity_id"], errors='coerce')
+                                        
+                                        for col in deps_cols:
+                                            if col in cpm_df_updated.columns:
+                                                st.session_state['recovery_schedule'][col] = st.session_state['recovery_schedule']["_temp_id"].map(cpm_df_updated[col])
+                                        
+                                        # Recalculate Forecasting (which uses CPM dates and propagates delays)
+                                        forecast_results_updated = forecasting_engine.calculate_forecasts(st.session_state['recovery_schedule'], dag_graph_updated)
+                                        fc_df_updated = pd.DataFrame.from_dict(forecast_results_updated, orient='index')
+                                        
+                                        fc_cols = ["percent_complete", "actual_duration", "baseline_1_duration", "remaining_duration_days",
+                                                   "forecast_start_date", "forecast_finish_date", 
+                                                   "delay_carried_in", "total_schedule_delay", 
+                                                   "task_created_delay", "delay_absorbed"]
+                                        
+                                        for col in fc_cols:
+                                            if col in fc_df_updated.columns:
+                                                st.session_state['recovery_schedule'][col] = st.session_state['recovery_schedule']["_temp_id"].map(fc_df_updated[col])
+                                        
+                                        # Clean up temp column
+                                        if "_temp_id" in st.session_state['recovery_schedule'].columns:
+                                            del st.session_state['recovery_schedule']["_temp_id"]
+                                        
+                                        # Recalculate costs (dates/duration may have changed)
+                                        if df_resource is not None:
+                                            cost_df_results_updated = cost_engine.calculate_costs(st.session_state['recovery_schedule'], df_resource)
+                                            cost_lookup_updated = cost_df_results_updated.set_index("activity_id")
+                                            cost_cols = ["planned_load_hours", "planned_cost", "actual_load_hours", 
+                                                        "actual_cost", "remaining_load_hours", "remaining_cost", "eac_cost"]
+                                            for col in cost_cols:
+                                                if col in cost_lookup_updated.columns:
+                                                    st.session_state['recovery_schedule'][col] = st.session_state['recovery_schedule']["activity_id"].map(cost_lookup_updated[col])
+                                        
+                                    except Exception as recalc_error:
+                                        st.warning(f"Date recalculation warning: {recalc_error}. Dates may not reflect Fast-Track changes.")
+                                    
                                     st.success(msg)
                                     st.session_state['applied_actions'].add(action_id)
                                     st.rerun()
@@ -616,8 +724,18 @@ with tabs[1]: # Schedule Recovery
                  params = action.get('parameters', {})
                  act_id = action.get('activity_id')
                  is_ov = params.get('is_overloaded', False)
+                 saved_days = params.get('saved_days', 0)
                  
-                 title = f"{act_id}: Critical | Save {params.get('saved_days', 0):.1f}d {'🔥' if is_ov else ''}"
+                 # Look up project info from recovery schedule
+                 project_name = "Unknown Project"
+                 if st.session_state.get('recovery_schedule') is not None:
+                     act_row = st.session_state['recovery_schedule'][
+                         st.session_state['recovery_schedule']["activity_id"].astype(str) == str(act_id)
+                     ]
+                     if not act_row.empty:
+                         project_name = act_row.iloc[0].get("project_name", "Unknown Project")
+                 
+                 title = f"Project: {project_name} | Activity ID: {act_id} | Critical Path | Save {saved_days:.1f}d {'🔥' if is_ov else ''}"
                  
                  with st.expander(title, expanded=False):
                     if "narrative" in action:
@@ -667,8 +785,21 @@ with tabs[1]: # Schedule Recovery
                  old_dur = params.get('old_dur', 0)
                  rec_red = params.get('reduce_by_days', 0)
                  
+                 # Look up project info and remaining duration from recovery schedule
+                 project_name = "Unknown Project"
+                 remaining_dur = old_dur  # Fallback to old_dur
+                 if st.session_state.get('recovery_schedule') is not None:
+                     act_row = st.session_state['recovery_schedule'][
+                         st.session_state['recovery_schedule']["activity_id"].astype(str) == str(act_id)
+                     ]
+                     if not act_row.empty:
+                         project_name = act_row.iloc[0].get("project_name", "Unknown Project")
+                         rem_dur_val = act_row.iloc[0].get("remaining_duration_days", old_dur)
+                         if pd.notna(rem_dur_val):
+                             remaining_dur = float(rem_dur_val)
+                 
                  # Expander Title
-                 title = f"{act_id}: Critical Path | {delay_in:.1f}d Delay"
+                 title = f"Project: {project_name} | Activity ID: {act_id} | Critical Path | {delay_in:.0f}d delay carried in | Remaining duration > {remaining_dur:.0f}"
                  
                  with st.expander(title, expanded=False):
                     # Row 1: Narrative
@@ -740,6 +871,94 @@ with tabs[1]: # Schedule Recovery
                                 
                                 success, msg = recovery_engine.apply_action(st.session_state['recovery_schedule'], action)
                                 if success:
+                                    # Recalculate dates after Duration Compression changes duration
+                                    # Compression changes duration, so we need to recalculate CPM/Forecasting to update dates
+                                    try:
+                                        # Store compressed durations before recalculation (to preserve them)
+                                        compressed_activities = st.session_state['recovery_schedule'][
+                                            st.session_state['recovery_schedule']["last_change_type"] == recovery_engine.ACTION_COMPRESS
+                                        ]
+                                        compressed_durations = {}
+                                        if not compressed_activities.empty:
+                                            compressed_durations = dict(zip(
+                                                compressed_activities["activity_id"].astype(int),
+                                                compressed_activities["planned_duration"]
+                                            ))
+                                        
+                                        # Rebuild DAG (dependencies haven't changed, but we need fresh graph)
+                                        dag_graph_updated, _ = dag_engine.build_dag_and_validate(st.session_state['recovery_schedule'])
+                                        
+                                        # Recalculate CPM with updated durations
+                                        # Note: calculate_durations now prefers planned_duration from dataframe, so compressed durations will be used
+                                        cpm_results_updated = cpm_engine.run_cpm(st.session_state['recovery_schedule'], dag_graph_updated)
+                                        durations_map_updated = cpm_engine.calculate_durations(st.session_state['recovery_schedule'])
+                                        
+                                        # Determine project start
+                                        if "planned_start" in st.session_state['recovery_schedule'].columns:
+                                            valid_starts = pd.to_datetime(st.session_state['recovery_schedule']["planned_start"], errors='coerce').dropna()
+                                            if not valid_starts.empty:
+                                                project_start = valid_starts.min()
+                                            else:
+                                                project_start = pd.Timestamp.today()
+                                        else:
+                                            project_start = pd.Timestamp.today()
+                                        
+                                        # Convert offsets to dates
+                                        cpm_results_updated = cpm_engine.convert_offsets_to_dates(cpm_results_updated, project_start, durations_map_updated)
+                                        
+                                        # Map CPM results back to recovery schedule
+                                        cpm_df_updated = pd.DataFrame.from_dict(cpm_results_updated, orient='index')
+                                        deps_cols = ["ES", "EF", "LS", "LF", "total_float_days", "on_critical_path", 
+                                                     "ES_date", "EF_date", "LS_date", "LF_date", "planned_duration"]
+                                        
+                                        # Create temp ID column for mapping
+                                        st.session_state['recovery_schedule']["_temp_id"] = pd.to_numeric(st.session_state['recovery_schedule']["activity_id"], errors='coerce')
+                                        
+                                        for col in deps_cols:
+                                            if col in cpm_df_updated.columns:
+                                                if col == "planned_duration" and compressed_durations:
+                                                    # For compressed activities, preserve the compressed duration
+                                                    # For others, use CPM calculated duration
+                                                    mapped_values = st.session_state['recovery_schedule']["_temp_id"].map(cpm_df_updated[col])
+                                                    # Preserve compressed durations
+                                                    for act_id, compressed_dur in compressed_durations.items():
+                                                        mask = st.session_state['recovery_schedule']["activity_id"].astype(int) == act_id
+                                                        if mask.any():
+                                                            mapped_values.loc[mask] = compressed_dur
+                                                    st.session_state['recovery_schedule'][col] = mapped_values
+                                                else:
+                                                    st.session_state['recovery_schedule'][col] = st.session_state['recovery_schedule']["_temp_id"].map(cpm_df_updated[col])
+                                        
+                                        # Recalculate Forecasting (which uses CPM dates and propagates delays)
+                                        forecast_results_updated = forecasting_engine.calculate_forecasts(st.session_state['recovery_schedule'], dag_graph_updated)
+                                        fc_df_updated = pd.DataFrame.from_dict(forecast_results_updated, orient='index')
+                                        
+                                        fc_cols = ["percent_complete", "actual_duration", "baseline_1_duration", "remaining_duration_days",
+                                                   "forecast_start_date", "forecast_finish_date", 
+                                                   "delay_carried_in", "total_schedule_delay", 
+                                                   "task_created_delay", "delay_absorbed"]
+                                        
+                                        for col in fc_cols:
+                                            if col in fc_df_updated.columns:
+                                                st.session_state['recovery_schedule'][col] = st.session_state['recovery_schedule']["_temp_id"].map(fc_df_updated[col])
+                                        
+                                        # Clean up temp column
+                                        if "_temp_id" in st.session_state['recovery_schedule'].columns:
+                                            del st.session_state['recovery_schedule']["_temp_id"]
+                                        
+                                        # Recalculate costs (duration changed, so costs need recalculation)
+                                        if df_resource is not None:
+                                            cost_df_results_updated = cost_engine.calculate_costs(st.session_state['recovery_schedule'], df_resource)
+                                            cost_lookup_updated = cost_df_results_updated.set_index("activity_id")
+                                            cost_cols = ["planned_load_hours", "planned_cost", "actual_load_hours", 
+                                                        "actual_cost", "remaining_load_hours", "remaining_cost", "eac_cost"]
+                                            for col in cost_cols:
+                                                if col in cost_lookup_updated.columns:
+                                                    st.session_state['recovery_schedule'][col] = st.session_state['recovery_schedule']["activity_id"].map(cost_lookup_updated[col])
+                                        
+                                    except Exception as recalc_error:
+                                        st.warning(f"Date recalculation warning: {recalc_error}. Dates may not reflect Compression changes.")
+                                    
                                     st.success(msg)
                                     st.session_state['applied_actions'].add(action_id)
                                     st.rerun()
@@ -1512,12 +1731,41 @@ with tabs[5]: # Project Data
             elif lct == recovery_engine.ACTION_COMPRESS:
                 mark_col("remaining_duration_days", highlight_source)
                 mark_col("planned_duration", highlight_source)
+                # Dates will change when duration is compressed
+                mark_col("forecast_start_date", highlight_source)
+                mark_col("forecast_finish_date", highlight_source)
+                mark_col("ES_date", highlight_source)
+                mark_col("EF_date", highlight_source)
+                mark_col("LS_date", highlight_source)
+                mark_col("LF_date", highlight_source)
+                mark_col("total_float_days", highlight_source)
+                mark_col("on_critical_path", highlight_source)
+                # Cost columns (already updated proportionally in apply_action, but highlight to show change)
+                mark_col("remaining_cost", highlight_source)
+                mark_col("eac_cost", highlight_source)
+                mark_col("remaining_load_hours", highlight_source)
             elif lct == recovery_engine.ACTION_RES_SWAP:
                 mark_col("resource_id", highlight_source) # Important
                 mark_col("resource_name", highlight_source)
                 mark_col("cost_per_hour", highlight_source)
                 mark_col("remaining_cost", highlight_source) # Cost savings
                 mark_col("planned_cost", highlight_source) # New Rate * Planned Hours
+            elif lct == recovery_engine.ACTION_FAST_TRACK:
+                mark_col("predecessors", highlight_source) # Changed dependency
+                mark_col("predecessor_id", highlight_source) # Changed dependency
+                # Dates will be recalculated due to dependency change
+                mark_col("forecast_start_date", highlight_source)
+                mark_col("forecast_finish_date", highlight_source)
+                mark_col("ES_date", highlight_source)
+                mark_col("EF_date", highlight_source)
+                mark_col("LS_date", highlight_source)
+                mark_col("LF_date", highlight_source)
+                mark_col("total_float_days", highlight_source)
+                mark_col("on_critical_path", highlight_source)
+                # Cost columns (may change if dates/duration change)
+                mark_col("remaining_cost", highlight_source)
+                mark_col("eac_cost", highlight_source)
+                mark_col("remaining_load_hours", highlight_source)
 
             # --- 2. Generic Diff vs Baseline (Propagation) ---
             # Compare this row against the original df_schedule

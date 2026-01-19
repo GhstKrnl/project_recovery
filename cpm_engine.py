@@ -4,13 +4,37 @@ import networkx as nx
 
 def calculate_durations(df):
     """
-    Calculates duration in business days (Mon-Fri) from planned_start and planned_finish.
+    Calculates duration in business days (Mon-Fri).
+    Prefers planned_duration or remaining_duration_days from dataframe if available.
+    Falls back to calculating from planned_start and planned_finish dates.
     Returns a dict mapping activity_id -> duration (int).
     """
     durations = {}
     for _, row in df.iterrows():
         try:
             act_id = int(row["activity_id"])
+            
+            # Priority 1: Use planned_duration if available and valid
+            if "planned_duration" in row and pd.notna(row["planned_duration"]):
+                try:
+                    dur_val = float(row["planned_duration"])
+                    if dur_val > 0:
+                        durations[act_id] = int(dur_val)
+                        continue
+                except (ValueError, TypeError):
+                    pass
+            
+            # Priority 2: Use remaining_duration_days if available and valid
+            if "remaining_duration_days" in row and pd.notna(row["remaining_duration_days"]):
+                try:
+                    dur_val = float(row["remaining_duration_days"])
+                    if dur_val > 0:
+                        durations[act_id] = int(dur_val)
+                        continue
+                except (ValueError, TypeError):
+                    pass
+            
+            # Priority 3: Fall back to calculating from dates
             start = pd.to_datetime(row["planned_start"])
             finish = pd.to_datetime(row["planned_finish"])
             
@@ -18,18 +42,6 @@ def calculate_durations(df):
                 durations[act_id] = 0
                 continue
                 
-            # busday_count excludes end date, so we add 1 day to finish to make it inclusive?
-            # Or we treat finish as inclusive working day.
-            # Example: Mon to Mon (1 day). busday_count(Mon, Mon) = 0.
-            # So if Start=Finish, duration should be 1.
-            # We need busday_count(Start, Finish + 1 day).
-            # But converting Finish+1 safely requires numpy busday logic or timedelta.
-            
-            # Simple approach: np.busday_count(start_date, end_date) where end_date is exclusive.
-            # So we shift finish by 1 day?
-            # Issue: If finish is Friday, Finish+1 is Saturday.
-            # busday_count(Fri, Sat) = 1. Correct.
-            
             # Convert to numpy datetime64[D]
             start_np = np.datetime64(start, 'D')
             finish_np = np.datetime64(finish, 'D')
