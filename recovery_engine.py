@@ -143,10 +143,29 @@ def generate_actions(df_schedule, resource_stats, df_resource, root_causes):
                      if is_busy:
                          continue
 
-                     # Calculate Savings
+                     # Calculate Savings using effort-based approach
+                     # Get task_planned_effort if available, otherwise calculate it
+                     task_effort = None
                      total_dur = float(act_row.get("planned_duration", 0))
-                     hours = total_dur * 8 * current_fte
-                     savings = (curr_rate - cand_rate) * hours
+                     
+                     if "task_planned_effort" in act_row.index and pd.notna(act_row.get("task_planned_effort")):
+                         task_effort = float(act_row.get("task_planned_effort"))
+                     else:
+                         # Calculate effort: planned_duration × old_resource_working_hours × fte
+                         old_work_hours = float(curr_res_row.iloc[0].get("resource_working_hours", 8.0)) if not curr_res_row.empty else 8.0
+                         if pd.isna(old_work_hours) or old_work_hours == 0:
+                             old_work_hours = 8.0
+                         task_effort = total_dur * old_work_hours * current_fte
+                     
+                     # Calculate savings: effort × (old_rate - new_rate)
+                     savings = task_effort * (curr_rate - cand_rate)
+                     
+                     # Calculate new duration for display (optional, for info)
+                     cand_work_hours = float(cand.get("resource_working_hours", 8.0))
+                     if pd.isna(cand_work_hours) or cand_work_hours == 0:
+                         cand_work_hours = 8.0
+                     new_dur = task_effort / (cand_work_hours * current_fte) if cand_work_hours * current_fte > 0 else total_dur
+                     duration_savings = total_dur - new_dur
                      
                      if savings > 0:
                          desc = f"Project: {proj_name} | Task: {act_row['activity_name']}\n"
@@ -164,7 +183,10 @@ def generate_actions(df_schedule, resource_stats, df_resource, root_causes):
                             "parameters": {
                                 "old_res": current_res, "old_name": curr_res_name, "old_rate": curr_rate,
                                 "new_res": cand_id, "new_name": cand_name, "new_rate": cand_rate,
-                                "savings": savings, "match_pct": match_pct
+                                "savings": savings, "match_pct": match_pct,
+                                "task_planned_effort": task_effort,
+                                "duration_savings": duration_savings,
+                                "new_duration": new_dur
                             },
                             "project_name": proj_name,
                             "resource_name": curr_res_name
@@ -396,10 +418,15 @@ def generate_actions(df_schedule, resource_stats, df_resource, root_causes):
             
     return actions
 
-def apply_action(df, action):
+def apply_action(df, action, df_resource=None):
     """
     Mutates df in place applying the action.
     Returns success (bool), message (str)
+    
+    Args:
+        df: DataFrame to modify
+        action: Action dictionary with type and parameters
+        df_resource: Optional resource DataFrame for looking up resource_working_hours
     """
     act_id = action.get("activity_id")
     # Find row index (Robust String Comparison)
@@ -416,6 +443,36 @@ def apply_action(df, action):
     if action["type"] == ACTION_RES_SWAP:
         new_res = action["parameters"]["new_res"]
         df.at[idx, "resource_id"] = new_res
+        
+        # Recalculate duration based on task_planned_effort (effort-based approach)
+        # Duration = task_planned_effort / (resource_working_hours × fte_allocation)
+        if "task_planned_effort" in df.columns:
+            task_effort = float(df.at[idx, "task_planned_effort"]) if pd.notna(df.at[idx, "task_planned_effort"]) else None
+            
+            if task_effort is not None and task_effort > 0:
+                # Get FTE allocation
+                fte = float(df.at[idx, "fte_allocation"]) if pd.notna(df.at[idx, "fte_allocation"]) else 1.0
+                if fte == 0:
+                    fte = 1.0  # Safety default
+                
+                # Look up new resource's working hours
+                new_work_hours = 8.0  # Default
+                if df_resource is not None:
+                    res_row = df_resource[df_resource["resource_id"].astype(str) == str(new_res)]
+                    if not res_row.empty:
+                        new_work_hours = float(res_row.iloc[0].get("resource_working_hours", 8.0))
+                        if pd.isna(new_work_hours) or new_work_hours == 0:
+                            new_work_hours = 8.0
+                
+                # Recalculate duration: effort / (work_hours × fte)
+                new_duration = task_effort / (new_work_hours * fte)
+                
+                # Update duration columns
+                df.at[idx, "remaining_duration_days"] = new_duration
+                df.at[idx, "planned_duration"] = new_duration  # Sync for CPM consistency
+                
+                return True, f"Swapped resource to {new_res}. Duration recalculated: {new_duration:.1f} days (from {task_effort:.1f} hrs effort)."
+        
         return True, f"Swapped resource to {new_res}."
         
     elif action["type"] == ACTION_FTE_ADJ:
@@ -429,6 +486,9 @@ def apply_action(df, action):
         if new_fte > 0:
             new_dur = current_dur * (old_fte / new_fte)
             df.at[idx, "remaining_duration_days"] = new_dur
+            # Sync planned_duration so CPM engine sees it (for consistency with remaining)
+            # CPM engine prioritizes planned_duration, so we must update it for dates to propagate
+            df.at[idx, "planned_duration"] = new_dur
             
         return True, f"Increased FTE to {new_fte}."
         
@@ -520,6 +580,9 @@ def apply_action(df, action):
         if new_fte > 0:
             new_dur = current_dur * (old_fte / new_fte)
             df.at[idx, "remaining_duration_days"] = new_dur
+            # Sync planned_duration so CPM engine sees it (for consistency with remaining)
+            # CPM engine prioritizes planned_duration, so we must update it for dates to propagate
+            df.at[idx, "planned_duration"] = new_dur
             
         return True, f"Crashed task! FTE doubled to {new_fte}. Duration halved."
         
