@@ -3,3 +3,5 @@ pandas
 networkx
 graphviz
 numpy
+python-dotenv
+requests

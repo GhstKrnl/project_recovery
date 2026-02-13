@@ -47,6 +47,16 @@ uploaded_resource = st.sidebar.file_uploader("Select Resource File", type=["csv"
 
 st.sidebar.markdown("---")
 
+# --- LLM Summary Toggle ---
+st.sidebar.markdown("### 3. Summary Settings")
+use_llm_summary = st.sidebar.toggle(
+    "Use LLM for Summary Generation",
+    value=False,
+    help="When enabled, summaries will be generated using Grok LLM API instead of heuristic AI"
+)
+
+st.sidebar.markdown("---")
+
 # --- Data Loading (Moved up for filters) ---
 df_schedule = None
 df_resource = None
@@ -97,7 +107,7 @@ elif os.path.exists("csv/resource_cost_unit.csv"):
         st.sidebar.error(f"Error reading csv/resource_cost_unit.csv: {e}")
 
 # --- Global Filters ---
-st.sidebar.subheader("3. Global Filters")
+st.sidebar.subheader("4. Global Filters")
 
 # Defaults
 portfolios = ["All"]
@@ -389,12 +399,13 @@ tabs = st.tabs([
 with tabs[0]: # Overview
     st.markdown("## 📊 Executive Project Dashboard")
     
-    # Portfolio Summary using Heuristic AI (isolated, non-breaking)
+    # Portfolio Summary using Heuristic AI or LLM (isolated, non-breaking)
     if df_schedule is not None and st.session_state.get('analyzed', False):
         try:
             import summary_engine
             portfolio_summary = summary_engine.generate_portfolio_summary(
-                df_schedule, df_resource, cost_df_results, resource_stats, rc_df
+                df_schedule, df_resource, cost_df_results, resource_stats, rc_df,
+                use_llm=use_llm_summary
             )
             if portfolio_summary:
                 st.markdown("### 📋 Portfolio Status Summary")
@@ -603,11 +614,13 @@ with tabs[0]: # Overview
 with tabs[1]: # Schedule Recovery
     st.subheader("Schedule Recovery Diagnostics")
     
-    # Schedule Summary using Heuristic AI (isolated, non-breaking)
+    # Schedule Summary using Heuristic AI or LLM (isolated, non-breaking)
     if df_schedule is not None and st.session_state.get('analyzed', False):
         try:
             import summary_engine
-            schedule_summary = summary_engine.generate_schedule_summary(df_schedule, rc_df)
+            schedule_summary = summary_engine.generate_schedule_summary(
+                df_schedule, rc_df, use_llm=use_llm_summary
+            )
             if schedule_summary:
                 st.markdown("### 📋 Schedule Status Summary")
                 st.info(schedule_summary)
@@ -1152,13 +1165,14 @@ with tabs[1]: # Schedule Recovery
 with tabs[2]: # Resource Recovery
     st.subheader("Resource Recovery Diagnostics")
     
-    # Resource Summary using Heuristic AI (isolated, non-breaking)
+    # Resource Summary using Heuristic AI or LLM (isolated, non-breaking)
     if df_schedule is not None and df_resource is not None:
         try:
             import summary_engine
             all_res_actions = st.session_state.get('generated_actions', [])
             resource_summary = summary_engine.generate_resource_summary(
-                df_schedule, df_resource, resource_stats, all_res_actions
+                df_schedule, df_resource, resource_stats, all_res_actions,
+                use_llm=use_llm_summary
             )
             if resource_summary:
                 st.markdown("### 📋 Resource Management Summary")
@@ -1622,11 +1636,13 @@ with tabs[2]: # Resource Recovery
 with tabs[3]: # Cost Recovery
     st.subheader("Cost Recovery Diagnostics")
     
-    # Cost Summary using Heuristic AI (isolated, non-breaking)
+    # Cost Summary using Heuristic AI or LLM (isolated, non-breaking)
     if df_schedule is not None and not cost_df_results.empty:
         try:
             import summary_engine
-            cost_summary = summary_engine.generate_cost_summary(df_schedule, cost_df_results)
+            cost_summary = summary_engine.generate_cost_summary(
+                df_schedule, cost_df_results, use_llm=use_llm_summary
+            )
             if cost_summary:
                 st.markdown("### 📋 Cost Management Summary")
                 st.info(cost_summary)
@@ -1682,29 +1698,149 @@ with tabs[3]: # Cost Recovery
         with st.expander("ℹ️ Understanding the Recovery Logic (Click to Expand)"):
             st.markdown("""
             **Condition for Scope Deferral:**
-            *   **Trigger**: Activity flagged with significant **Cost Overrun** or **Risk**.
-            *   **Rule**: Mark activity as 'Deferred' (Remaining Duration set to 0).
-            *   **Goal**: Reduce projected spend by removing low-priority or high-risk scope from the immediate baseline.
+            *   **Trigger**: User manually selects activities to defer from the activity list.
+            *   **Rule**: Only activities with **no actual costs or hours** can be deferred (activities that haven't started).
+            *   **Action**: When deferred, the activity's FTE allocation is set to 0, and all planned cost attributes (planned_load_hours, planned_cost, remaining_load_hours, remaining_cost, eac_cost) are set to 0.
+            *   **Goal**: Reduce projected spend by removing low-priority scope from the immediate baseline. Deferred activities are effectively removed from cost calculations while preserving the activity record.
             """)
         
-        cost_actions = [a for a in st.session_state.get('generated_actions', []) 
-                        if a['type'] == recovery_engine.ACTION_DEFERRAL]
-                        
         st.markdown("#### Scope Deferral")
-        if cost_actions:
-             for i, action in enumerate(cost_actions):
-                with st.expander(f"{action.get('activity_id')} (Potential Deferral)"):
-                    st.warning(action['description'])
+        
+        # Filter activities: only show those with no actuals (can be deferred)
+        if df_schedule is not None and not df_schedule.empty:
+            # Get activities with no actual costs or hours
+            df_schedule_copy = df_schedule.copy()
+            
+            # Ensure numeric columns exist and are filled
+            if "actual_cost" in df_schedule_copy.columns:
+                df_schedule_copy["actual_cost"] = pd.to_numeric(df_schedule_copy["actual_cost"], errors='coerce').fillna(0)
+            else:
+                df_schedule_copy["actual_cost"] = 0
+            
+            if "actual_load_hours" in df_schedule_copy.columns:
+                df_schedule_copy["actual_load_hours"] = pd.to_numeric(df_schedule_copy["actual_load_hours"], errors='coerce').fillna(0)
+            else:
+                df_schedule_copy["actual_load_hours"] = 0
+            
+            # Filter: only activities with no actuals and not already deferred
+            deferrable_mask = (df_schedule_copy["actual_cost"] == 0) & (df_schedule_copy["actual_load_hours"] == 0)
+            
+            # Exclude already deferred activities
+            if "is_deferred" in df_schedule_copy.columns:
+                deferrable_mask = deferrable_mask & (df_schedule_copy["is_deferred"] != True)
+            
+            deferrable_activities = df_schedule_copy[deferrable_mask].copy()
+            
+            if not deferrable_activities.empty:
+                # Initialize session state for selected activities
+                if "deferral_selected_activities" not in st.session_state:
+                    st.session_state["deferral_selected_activities"] = []
+                
+                # Prepare summary table with key columns
+                summary_cols = ["activity_id", "activity_name", "project_name", "planned_cost", "fte_allocation", "planned_duration"]
+                display_cols = [c for c in summary_cols if c in deferrable_activities.columns]
+                
+                # Create display dataframe with selection checkbox
+                display_df = deferrable_activities[display_cols].copy()
+                
+                # Format numeric columns (keep as numeric for proper display in data_editor)
+                if "planned_cost" in display_df.columns:
+                    display_df["planned_cost"] = pd.to_numeric(display_df["planned_cost"], errors='coerce').fillna(0)
+                
+                if "fte_allocation" in display_df.columns:
+                    display_df["fte_allocation"] = pd.to_numeric(display_df["fte_allocation"], errors='coerce').fillna(0)
+                
+                if "planned_duration" in display_df.columns:
+                    display_df["planned_duration"] = pd.to_numeric(display_df["planned_duration"], errors='coerce').fillna(0)
+                
+                # Initialize Select column - st.data_editor will preserve state automatically
+                display_df.insert(0, "Select", False)
+                
+                st.markdown("**Activities Summary** (Select rows to defer)")
+                st.caption("Only activities with no actual costs or hours are shown. Use the 'Select' column to choose activities for deferral.")
+                
+                # Use data_editor to allow checkbox selection
+                # st.data_editor automatically preserves state via the key parameter
+                edited_df = st.data_editor(
+                    display_df,
+                    use_container_width=True,
+                    key="scope_deferral_editor",
+                    column_config={
+                        "Select": st.column_config.CheckboxColumn("Select", default=False),
+                        "activity_id": st.column_config.TextColumn("Activity ID", width="small"),
+                        "activity_name": st.column_config.TextColumn("Activity Name"),
+                        "project_name": st.column_config.TextColumn("Project Name"),
+                        "planned_cost": st.column_config.NumberColumn("Planned Cost", format="$%.2f"),
+                        "fte_allocation": st.column_config.NumberColumn("FTE Allocation", format="%.2f"),
+                        "planned_duration": st.column_config.NumberColumn("Planned Duration", format="%.1f")
+                    },
+                    hide_index=True,
+                    disabled=["activity_id", "activity_name", "project_name", "planned_cost", "fte_allocation", "planned_duration"]
+                )
+                
+                # Get selected activity IDs from edited dataframe
+                selected_mask = edited_df["Select"] == True
+                selected_activity_ids = edited_df[selected_mask]["activity_id"].astype(str).tolist()
+                
+                # Update session state
+                st.session_state["deferral_selected_activities"] = selected_activity_ids
+                
+                if selected_activity_ids:
                     
-                    if st.button("Defer Scope", key=f"btn_cost_{i}", type="primary"):
-                         success, msg = recovery_engine.apply_action(st.session_state['recovery_schedule'], action)
-                         if success:
-                             st.success(msg)
-                             st.rerun()
-                         else:
-                             st.error(msg)
+                    st.info(f"**{len(selected_activity_ids)} activity/activities** selected for deferral.")
+                    
+                    # Show selected activities summary
+                    st.markdown("**Selected Activities Summary**")
+                    selected_df = deferrable_activities[deferrable_activities["activity_id"].astype(str).isin(selected_activity_ids)]
+                    
+                    summary_display_cols = ["activity_id", "activity_name", "project_name", "planned_cost", "fte_allocation"]
+                    summary_display_cols = [c for c in summary_display_cols if c in selected_df.columns]
+                    st.dataframe(selected_df[summary_display_cols], use_container_width=True)
+                    
+                    # Apply button
+                    if st.button("Apply Deferral", key="btn_apply_deferral", type="primary"):
+                        if st.session_state.get('recovery_schedule') is not None:
+                            success_count = 0
+                            applied_activities = []
+                            error_messages = []
+                            
+                            for act_id in selected_activity_ids:
+                                # Create deferral action
+                                deferral_action = {
+                                    "id": f"manual_defer_{act_id}_{pd.Timestamp.now().timestamp()}",
+                                    "type": recovery_engine.ACTION_DEFERRAL,
+                                    "activity_id": act_id,
+                                    "description": f"Manual scope deferral for Activity {act_id}",
+                                    "parameters": {"set_deferred": True, "manual": True}
+                                }
+                                
+                                success, msg = recovery_engine.apply_action(st.session_state['recovery_schedule'], deferral_action)
+                                if success:
+                                    success_count += 1
+                                    applied_activities.append(act_id)
+                                else:
+                                    error_messages.append(f"Activity {act_id}: {msg}")
+                            
+                            if success_count > 0:
+                                st.success(f"✅ Successfully deferred **{success_count} activity/activities**.")
+                                st.markdown("**✅ Applied Activities:**")
+                                applied_list = "\n".join([f"- Activity {act_id}" for act_id in applied_activities])
+                                st.markdown(applied_list)
+                                if error_messages:
+                                    st.warning("⚠️ Some activities could not be deferred:")
+                                    for err in error_messages:
+                                        st.warning(err)
+                                st.rerun()
+                            else:
+                                st.error("Failed to defer activities. " + "; ".join(error_messages))
+                        else:
+                            st.error("Recovery schedule not available. Please run analysis first.")
+                else:
+                    st.info("👆 Select one or more activities from the table above using the 'Select' checkbox column.")
+            else:
+                st.info("No activities available for deferral. All activities have actual costs or hours recorded.")
         else:
-            st.info("No scope deferral opportunities found (based on Cost/Risk triggers).")
+            st.info("Schedule data not available. Please upload and analyze schedule first.")
             
     else:
         st.info("No Cost Data Calculated.")

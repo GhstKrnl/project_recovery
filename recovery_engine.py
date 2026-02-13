@@ -565,8 +565,31 @@ def apply_action(df, action, df_resource=None):
         return True, f"Fast-tracked dependency on Activity {target_pred} (Converted to SS+2d)."
         
     elif action["type"] == ACTION_DEFERRAL:
+        # Set is_deferred flag
         df.at[idx, "is_deferred"] = True
-        return True, "Activity deferred (removed from calculation)."
+        
+        # Set FTE allocation to zero
+        df.at[idx, "fte_allocation"] = 0
+        
+        # Set all cost attributes to zero
+        cost_columns = [
+            "planned_load_hours",
+            "planned_cost",
+            "remaining_load_hours",
+            "remaining_cost",
+            "eac_cost"
+        ]
+        
+        for col in cost_columns:
+            if col in df.columns:
+                df.at[idx, col] = 0
+        
+        # Also set remaining_duration_days to 0 to remove from schedule calculations
+        if "remaining_duration_days" in df.columns:
+            df.at[idx, "remaining_duration_days"] = 0
+        
+        act_id = df.at[idx, "activity_id"]
+        return True, f"Activity {act_id} deferred: FTE allocation and all planned costs set to zero."
         
     elif action["type"] == ACTION_CRASHING:
         # Same mechanics as FTE Adjustment, but sets highlighting differently

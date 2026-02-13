@@ -1,19 +1,136 @@
 """
 Heuristic AI Summary Engine
 Generates natural language summaries for Overview, Schedule Recovery, Resource Recovery, and Cost Recovery tabs.
+Supports both heuristic AI and LLM-based generation.
 """
 
 import pandas as pd
 import numpy as np
 from datetime import datetime
+import os
+import requests
+from dotenv import load_dotenv
 
-def generate_portfolio_summary(df_schedule, df_resource, cost_df_results, resource_stats, rc_df):
+# Load environment variables
+load_dotenv()
+
+# Grok API configuration
+GROK_API_KEY = os.getenv("GROK_API_KEY", "")
+GROK_API_URL = "https://api.x.ai/v1/chat/completions"
+
+
+def _call_grok_api(prompt, summary_type="general"):
+    """
+    Calls Grok API to generate a summary.
+    Returns the generated summary text or None on error.
+    """
+    if not GROK_API_KEY:
+        return None
+    
+    try:
+        headers = {
+            "Authorization": f"Bearer {GROK_API_KEY}",
+            "Content-Type": "application/json"
+        }
+        
+        payload = {
+            "model": "grok-4-1-fast-non-reasoning",  # Can be changed to grok-beta, grok-3, etc. based on API key access
+            "messages": [
+                {
+                    "role": "system",
+                    "content": f"You are a project management analyst. Generate a concise, professional summary in natural English language for {summary_type}. Use markdown formatting for emphasis. Be specific with numbers and metrics."
+                },
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ],
+            "temperature": 0.7,
+            "max_tokens": 500
+        }
+        
+        response = requests.post(GROK_API_URL, json=payload, headers=headers, timeout=30)
+        response.raise_for_status()
+        
+        result = response.json()
+        if "choices" in result and len(result["choices"]) > 0:
+            return result["choices"][0]["message"]["content"].strip()
+        
+        return None
+    except Exception as e:
+        # Silently fail and fall back to heuristic
+        return None
+
+
+def _prepare_data_context(df_schedule, df_resource=None, cost_df_results=None, resource_stats=None, rc_df=None):
+    """
+    Prepares a text context from dataframes for LLM prompts.
+    """
+    context_parts = []
+    
+    if df_schedule is not None and not df_schedule.empty:
+        context_parts.append(f"Schedule Data: {len(df_schedule)} activities")
+        if "project_name" in df_schedule.columns:
+            projects = df_schedule["project_name"].unique()
+            context_parts.append(f"Projects: {', '.join(projects[:5])}")
+        if "percent_complete" in df_schedule.columns:
+            pct = df_schedule["percent_complete"].mean()
+            context_parts.append(f"Average completion: {pct:.1f}%")
+        if "on_critical_path" in df_schedule.columns:
+            critical = df_schedule["on_critical_path"].sum() if df_schedule["on_critical_path"].dtype == bool else 0
+            context_parts.append(f"Critical path activities: {critical}")
+    
+    if df_resource is not None and not df_resource.empty:
+        context_parts.append(f"Resources: {len(df_resource)} total")
+    
+    if cost_df_results is not None and not cost_df_results.empty:
+        if "planned_cost" in cost_df_results.columns and "eac_cost" in cost_df_results.columns:
+            planned = cost_df_results["planned_cost"].sum()
+            eac = cost_df_results["eac_cost"].sum()
+            context_parts.append(f"Planned cost: ${planned:,.0f}, EAC: ${eac:,.0f}")
+    
+    if resource_stats:
+        overloaded = sum(1 for stats in resource_stats.values() if stats.get("overload_days_count", 0) > 0)
+        context_parts.append(f"Overallocated resources: {overloaded}")
+    
+    if rc_df is not None and not rc_df.empty:
+        context_parts.append(f"Root causes identified: {len(rc_df)}")
+    
+    return "\n".join(context_parts)
+
+def generate_portfolio_summary(df_schedule, df_resource, cost_df_results, resource_stats, rc_df, use_llm=False):
     """
     Generates a natural language summary of portfolio status for Overview tab.
     Returns empty string if data is not available.
+    
+    Args:
+        use_llm: If True, uses LLM API for generation. Otherwise uses heuristic AI.
     """
     if df_schedule is None or df_schedule.empty:
         return ""
+    
+    # Use LLM if requested and API key is available
+    if use_llm and GROK_API_KEY:
+        context = _prepare_data_context(df_schedule, df_resource, cost_df_results, resource_stats, rc_df)
+        prompt = f"""Analyze this project portfolio status and provide a comprehensive summary:
+
+{context}
+
+Provide a natural language summary covering:
+- Portfolio overview (number of projects, activities)
+- Completion status
+- Schedule performance (on-time, delays, ahead)
+- Critical path status
+- Cost performance (budget variance)
+- Resource allocation status
+- Risk indicators
+
+Format the summary professionally with markdown formatting."""
+        
+        llm_summary = _call_grok_api(prompt, "Portfolio Status Summary")
+        if llm_summary:
+            return llm_summary
+        # Fall back to heuristic if LLM fails
     
     summary_parts = []
     
@@ -99,13 +216,58 @@ def generate_portfolio_summary(df_schedule, df_resource, cost_df_results, resour
         return "Portfolio analysis is in progress. Please ensure all data is loaded and analysis has been run."
 
 
-def generate_schedule_summary(df_schedule, rc_df):
+def generate_schedule_summary(df_schedule, rc_df, use_llm=False):
     """
     Generates a natural language summary of schedule recovery status for Schedule Recovery tab.
     Returns empty string if data is not available.
+    
+    Args:
+        use_llm: If True, uses LLM API for generation. Otherwise uses heuristic AI.
     """
     if df_schedule is None or df_schedule.empty:
         return ""
+    
+    # Use LLM if requested and API key is available
+    if use_llm and GROK_API_KEY:
+        context = _prepare_data_context(df_schedule, rc_df=rc_df)
+        
+        # Add schedule-specific details
+        schedule_details = []
+        if "total_schedule_delay" in df_schedule.columns:
+            delayed = df_schedule[df_schedule["total_schedule_delay"] > 0]
+            if len(delayed) > 0:
+                max_delay = delayed["total_schedule_delay"].max()
+                schedule_details.append(f"Delayed activities: {len(delayed)}, Max delay: {max_delay:.1f} days")
+                if "task_created_delay" in delayed.columns:
+                    top_delayed = delayed.nlargest(3, "task_created_delay")
+                    for _, row in top_delayed.iterrows():
+                        proj = row.get("project_name", "Unknown")
+                        act = row.get("activity_name", row.get("activity_id", "Unknown"))
+                        delay = row.get("task_created_delay", 0)
+                        schedule_details.append(f"- {proj} - {act}: {delay:.1f}d delay")
+        
+        if rc_df is not None and not rc_df.empty and "Root Cause Category" in rc_df.columns:
+            rc_by_cat = rc_df["Root Cause Category"].value_counts()
+            schedule_details.append(f"Root causes: {dict(rc_by_cat.head(3))}")
+        
+        prompt = f"""Analyze this project schedule status and provide a summary:
+
+{context}
+{chr(10).join(schedule_details)}
+
+Provide a natural language summary covering:
+- Project coverage
+- Delayed activities and their impact
+- Critical path activities requiring attention
+- Root causes of delays
+- Top delayed activities with project references
+
+Format professionally with markdown."""
+        
+        llm_summary = _call_grok_api(prompt, "Schedule Status Summary")
+        if llm_summary:
+            return llm_summary
+        # Fall back to heuristic if LLM fails
     
     summary_parts = []
     
@@ -171,13 +333,61 @@ def generate_schedule_summary(df_schedule, rc_df):
         return "Schedule analysis is in progress. Please ensure analysis has been run."
 
 
-def generate_resource_summary(df_schedule, df_resource, resource_stats, generated_actions):
+def generate_resource_summary(df_schedule, df_resource, resource_stats, generated_actions, use_llm=False):
     """
     Generates a natural language summary of resource management status for Resource Recovery tab.
     Returns empty string if data is not available.
+    
+    Args:
+        use_llm: If True, uses LLM API for generation. Otherwise uses heuristic AI.
     """
     if df_schedule is None or df_schedule.empty:
         return ""
+    
+    # Use LLM if requested and API key is available
+    if use_llm and GROK_API_KEY:
+        context = _prepare_data_context(df_schedule, df_resource, resource_stats=resource_stats)
+        
+        # Add resource-specific details
+        resource_details = []
+        if resource_stats:
+            overloaded = []
+            for res_id, stats in resource_stats.items():
+                overload_days = stats.get("overload_days_count", 0)
+                if overload_days > 0:
+                    res_name = str(res_id)
+                    if df_resource is not None and "resource_id" in df_resource.columns:
+                        res_row = df_resource[df_resource["resource_id"].astype(str) == str(res_id)]
+                        if not res_row.empty and "resource_name" in res_row.columns:
+                            res_name = res_row.iloc[0].get("resource_name", str(res_id))
+                    overloaded.append(f"{res_name}: {overload_days:.0f}d overload")
+            if overloaded:
+                resource_details.append(f"Overallocated resources: {', '.join(overloaded[:5])}")
+        
+        if generated_actions:
+            resource_actions = [a for a in generated_actions if a.get('type') in ['RES_SWAP', 'FTE_ADJ']]
+            if resource_actions:
+                swap_count = sum(1 for a in resource_actions if a.get('type') == 'RES_SWAP')
+                fte_count = sum(1 for a in resource_actions if a.get('type') == 'FTE_ADJ')
+                resource_details.append(f"Recovery opportunities: {swap_count} swaps, {fte_count} FTE adjustments")
+        
+        prompt = f"""Analyze this resource management status and provide a summary:
+
+{context}
+{chr(10).join(resource_details)}
+
+Provide a natural language summary covering:
+- Resource overview
+- Overallocated resources and their impact
+- Recovery opportunities (swaps, FTE adjustments)
+- Project references
+
+Format professionally with markdown."""
+        
+        llm_summary = _call_grok_api(prompt, "Resource Management Summary")
+        if llm_summary:
+            return llm_summary
+        # Fall back to heuristic if LLM fails
     
     summary_parts = []
     
@@ -239,13 +449,59 @@ def generate_resource_summary(df_schedule, df_resource, resource_stats, generate
         return "Resource analysis is in progress. Please ensure analysis has been run."
 
 
-def generate_cost_summary(df_schedule, cost_df_results):
+def generate_cost_summary(df_schedule, cost_df_results, use_llm=False):
     """
     Generates a natural language summary of cost management status for Cost Recovery tab.
     Returns empty string if data is not available.
+    
+    Args:
+        use_llm: If True, uses LLM API for generation. Otherwise uses heuristic AI.
     """
     if df_schedule is None or df_schedule.empty or cost_df_results.empty:
         return ""
+    
+    # Use LLM if requested and API key is available
+    if use_llm and GROK_API_KEY:
+        context = _prepare_data_context(df_schedule, cost_df_results=cost_df_results)
+        
+        # Add cost-specific details
+        cost_details = []
+        if "planned_cost" in cost_df_results.columns and "eac_cost" in cost_df_results.columns:
+            planned = cost_df_results["planned_cost"].sum()
+            eac = cost_df_results["eac_cost"].sum()
+            var = eac - planned
+            var_pct = (var / planned * 100) if planned > 0 else 0
+            cost_details.append(f"Cost variance: ${var:,.0f} ({var_pct:.1f}%)")
+        
+        if "cost_variance" in cost_df_results.columns or ("actual_cost" in cost_df_results.columns and "planned_cost" in cost_df_results.columns):
+            if "cost_variance" not in cost_df_results.columns:
+                cost_df_results = cost_df_results.copy()
+                cost_df_results["cost_variance"] = cost_df_results.get("actual_cost", 0) - cost_df_results.get("planned_cost", 0)
+            overruns = cost_df_results[cost_df_results["cost_variance"] > 1000]
+            if len(overruns) > 0:
+                top_overruns = overruns.nlargest(3, "cost_variance")
+                for _, row in top_overruns.iterrows():
+                    act_id = row.get("activity_id", "Unknown")
+                    var = row.get("cost_variance", 0)
+                    cost_details.append(f"Top overrun: Activity {act_id} - ${var:,.0f}")
+        
+        prompt = f"""Analyze this cost management status and provide a summary:
+
+{context}
+{chr(10).join(cost_details)}
+
+Provide a natural language summary covering:
+- Project coverage
+- Cost performance (budget variance, overruns, savings)
+- Top cost overruns with project references
+- Current spending vs remaining costs
+
+Format professionally with markdown."""
+        
+        llm_summary = _call_grok_api(prompt, "Cost Management Summary")
+        if llm_summary:
+            return llm_summary
+        # Fall back to heuristic if LLM fails
     
     summary_parts = []
     
